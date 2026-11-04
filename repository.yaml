@@ -1,0 +1,4 @@
+# https://developers.home-assistant.io/docs/add-ons/repository#repository-configuration
+name: nanoBit93's Home Assistant add-ons
+url: 'https://github.com/nanoBit93/EOS_connect'
+maintainer: 'nanoBit93 <nanoBit93@users.noreply.github.com>'

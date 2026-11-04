@@ -1,0 +1,31 @@
+{
+  "strategy": {
+    "charging_strategy": "charge_before_export",
+    "discharging_strategy": "discharge_before_import"
+  },
+  "grid": {
+    "p_max_imp": 10000,
+    "p_max_exp": 10000,
+    "prc_p_imp_exc": 0
+  },
+  "batteries": [],
+  "time_series": {
+    "dt": [
+      198
+    ],
+    "gt": [
+      0.0
+    ],
+    "ft": [
+      0.0
+    ],
+    "p_N": [
+      0.0
+    ],
+    "p_E": [
+      0.0
+    ]
+  },
+  "eta_c": 0.95,
+  "eta_d": 0.95
+}

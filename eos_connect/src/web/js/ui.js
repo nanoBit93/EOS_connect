@@ -1,0 +1,1009 @@
+/**
+ * UI helper functions, overlays, animations
+ * Extracted from legacy index.html
+ */
+
+function isMobile() {
+    return window.innerWidth <= 768;
+}
+
+function writeIfValueChanged(id, value) {
+    const element = document.getElementById(id);
+    if (element.innerText !== value) {
+        element.innerText = value;
+        element.classList.add('valueChange');
+        setTimeout(() => {
+            element.classList.remove('valueChange');
+        }, 1000); // Remove the class after 1 second
+    }
+}
+
+function overlayMenu(header, content, close = true) {
+    const overlay = document.getElementById('overlay_menu');
+    // Always update content, whether overlay is open or closed
+    overlay.style.display = 'flex';
+    document.getElementById('overlay_menu_head').innerHTML = header;
+    document.getElementById('overlay_menu_content').innerHTML = content;
+    document.getElementById('overlay_menu_close').style.display = close ? '' : 'none';
+
+    // Block background scrolling
+    document.body.style.overflow = 'hidden';
+}
+
+function closeOverlayMenu(direct = true) {
+    const overlay = document.getElementById('overlay_menu');
+    if (overlay.style.display === 'flex') {
+        if (direct) {
+            overlayMenu('', '', false);
+            overlay.style.display = 'none';
+            // Restore background scrolling
+            document.body.style.overflow = '';
+        } else {
+            overlay.style.transition = 'opacity 1s';
+            overlay.style.opacity = '0';
+            setTimeout(() => {
+                overlayMenu('', '', false);
+                overlay.style.display = 'none';
+                overlay.style.opacity = '1';
+                // Restore background scrolling
+                document.body.style.overflow = '';
+            }, 250);
+        }
+    }
+}
+
+function getBatteryIcon(soc_value) {
+    if (soc_value > 90) {
+        return '<i class="fa-solid fa-battery-full"></i>';
+    } else if (soc_value > 70) {
+        return '<i class="fa-solid fa-battery-three-quarters"></i>';
+    } else if (soc_value > 50) {
+        return '<i class="fa-solid fa-battery-half"></i>';
+    } else if (soc_value > 30) {
+        return '<i class="fa-solid fa-battery-quarter"></i>';
+    } else {
+        return '<i class="fa-solid fa-battery-empty"></i>';
+    }
+}
+
+// Initialize value change observers
+function initializeValueChangeObservers() {
+    Array.from(document.getElementsByClassName("valueChange")).forEach(function (element) {
+        const observer = new MutationObserver(function (mutationsList, observer) {
+            const elem = mutationsList[0].target;
+            elem.style.color = "black";
+            setTimeout(function () {
+                elem.style.color = "inherit";
+            }, 1000);
+        });
+        observer.observe(element, { characterData: false, childList: true, attributes: false });
+    });
+}
+
+/**
+ * Test Control Functions for Development and Testing
+ */
+function toggleTestPanel() {
+    const testControls = document.getElementById('test_controls');
+
+    if (testControls.style.display === 'none' || testControls.style.display === '') {
+        testControls.style.display = 'block';
+    } else {
+        testControls.style.display = 'none';
+    }
+}
+
+function switchTestScenario() {
+    const select = document.getElementById('test_scenario_select');
+    const scenario = select.value;
+
+    if (scenario === 'live') {
+        currentTestScenario = TEST_SCENARIOS.LIVE;
+    } else {
+        currentTestScenario = scenario;
+    }
+
+    console.log('[TestMode] Switched to scenario:', currentTestScenario);
+
+    // Automatically refresh data when switching scenarios
+    refreshTestData();
+}
+
+async function refreshTestData() {
+    console.log('[TestMode] Refreshing data with scenario:', currentTestScenario);
+
+    // Force refresh by calling init() which will use the current test scenario
+    if (typeof init === 'function') {
+        await init();
+    }
+}
+
+function showTestPanel() {
+    const panel = document.getElementById('test_control_panel');
+    if (panel) {
+        panel.style.display = 'block';
+    }
+}
+
+function hideTestPanel() {
+    const panel = document.getElementById('test_control_panel');
+    if (panel) {
+        panel.style.display = 'none';
+    }
+}
+
+// Initialize test panel on page load
+document.addEventListener('DOMContentLoaded', function () {
+    // Show test panel ONLY if URL contains test=1 parameter
+    const urlParams = new URLSearchParams(window.location.search);
+    const isTestParam = urlParams.get('test') === '1';
+
+    if (isTestParam) {
+        console.log('[TestMode] Test mode activated via ?test=1 parameter');
+        setTimeout(() => showTestPanel(), 1000); // Show after page loads
+    } else {
+        console.log('[TestMode] Test mode not activated (no ?test=1 parameter)');
+    }
+});
+
+/**
+ * Show main dropdown menu near the menu icon
+ */
+function showMainMenu(version, backend, granularity) {
+    // Remove existing dropdown if present
+    const existingDropdown = document.getElementById('main-dropdown-menu');
+    if (existingDropdown) {
+        existingDropdown.remove();
+        return; // Toggle behavior - close if already open
+    }
+
+    // Create dropdown menu
+    const dropdown = document.createElement('div');
+    dropdown.id = 'main-dropdown-menu';
+    // The size is in rem, not em: the menu is appended into a .top-box, whose own text is
+    // sized from the tile's width for the tiles' sake and is no basis for a menu.
+    dropdown.style.cssText = `
+        position: absolute;
+        top: 45px;
+        left: 10px;
+        background-color: rgb(58, 58, 58);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 8px;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+        z-index: 1000;
+        min-width: 180px;
+        padding: 8px 0;
+        font-size: ${isMobile() ? '0.8rem' : '0.85rem'};
+    `;
+
+    dropdown.innerHTML = `
+        <div onclick="showOverrideControlsMenu(); closeDropdownMenu();" style="cursor: pointer; padding: 10px 15px; transition: background-color 0.2s; display: flex; align-items: center;" 
+            onmouseover="this.style.backgroundColor='rgba(100, 100, 100, 0.5)'" 
+            onmouseout="this.style.backgroundColor='transparent'">
+            <i class="fa-solid fa-sliders" style="margin-right: 10px; color: #cccccc; width: 16px;"></i>
+            <span>Override Controls</span>
+        </div>
+
+        <!-- Managed Loads and PV Auto-Scaling sit with Override Controls: all three are
+             what the optimizer is doing right now. They were below Alarms, which is
+             where diagnostics live. Managed Loads appears only once a load is
+             configured; PV Auto-Scaling always does. -->
+        ${(typeof controlsManager !== 'undefined' && controlsManager
+            && (controlsManager.managedLoads || []).length) ? `
+        <div onclick="showManagedLoadsMenu(); closeDropdownMenu();" style="cursor: pointer; padding: 10px 15px; transition: background-color 0.2s; display: flex; align-items: center;"
+            onmouseover="this.style.backgroundColor='rgba(100, 100, 100, 0.5)'"
+            onmouseout="this.style.backgroundColor='transparent'">
+            <i class="fa-solid fa-sliders" style="margin-right: 10px; color: #cccccc; width: 16px;"></i>
+            <span>Managed Loads</span>
+        </div>` : ''}
+
+        <div onclick="showPvAutoscalingMenu(); closeDropdownMenu();" style="cursor: pointer; padding: 10px 15px; transition: background-color 0.2s; display: flex; align-items: center;"
+            onmouseover="this.style.backgroundColor='rgba(100, 100, 100, 0.5)'"
+            onmouseout="this.style.backgroundColor='transparent'">
+            <i class="fa-solid fa-arrows-up-down" style="margin-right: 10px; color: #cccccc; width: 16px;"></i>
+            <span>PV Auto-Scaling</span>
+        </div>
+
+        <div onclick="showBatteryOverviewMenu(); closeDropdownMenu();" style="cursor: pointer; padding: 10px 15px; transition: background-color 0.2s; display: flex; align-items: center;" 
+            onmouseover="this.style.backgroundColor='rgba(100, 100, 100, 0.5)'" 
+            onmouseout="this.style.backgroundColor='transparent'">
+            <i class="fa-solid fa-battery-full" style="margin-right: 10px; color: #cccccc; width: 16px;"></i>
+            <span>Battery Overview</span>
+        </div>
+        
+        <hr style="border: none; border-top: 1px solid rgba(255, 255, 255, 0.1); margin: 5px 0;">
+        
+        <div onclick="showAlarmsMenu(); closeDropdownMenu();" style="cursor: pointer; padding: 10px 15px; transition: background-color 0.2s; display: flex; align-items: center;" 
+            onmouseover="this.style.backgroundColor='rgba(100, 100, 100, 0.5)'" 
+            onmouseout="this.style.backgroundColor='transparent'">
+            <i class="fa-solid fa-triangle-exclamation" style="margin-right: 10px; color: #cccccc; width: 16px;"></i>
+            <span>Alarms</span>
+        </div>
+        
+        <div onclick="showLogsMenu(); closeDropdownMenu();" style="cursor: pointer; padding: 10px 15px; transition: background-color 0.2s; display: flex; align-items: center;" 
+            onmouseover="this.style.backgroundColor='rgba(100, 100, 100, 0.5)'" 
+            onmouseout="this.style.backgroundColor='transparent'">
+            <i class="fa-solid fa-list-ul" style="margin-right: 10px; color: #cccccc; width: 16px;"></i>
+            <span>Logs</span>
+        </div>
+        
+        <div onclick="showConfigurationMenu(); closeDropdownMenu();" style="cursor: pointer; padding: 10px 15px; transition: background-color 0.2s; display: flex; align-items: center;" 
+            onmouseover="this.style.backgroundColor='rgba(100, 100, 100, 0.5)'" 
+            onmouseout="this.style.backgroundColor='transparent'">
+            <i class="fa-solid fa-gear" style="margin-right: 10px; color: #cccccc; width: 16px;"></i>
+            <span>Configuration</span>
+        </div>
+
+        <div onclick="showBackupMenu(); closeDropdownMenu();" style="cursor: pointer; padding: 10px 15px; transition: background-color 0.2s; display: flex; align-items: center;"
+            onmouseover="this.style.backgroundColor='rgba(100, 100, 100, 0.5)'"
+            onmouseout="this.style.backgroundColor='transparent'">
+            <i class="fa-solid fa-box-archive" style="margin-right: 10px; color: #cccccc; width: 16px;"></i>
+            <span>Backup &amp; Restore</span>
+        </div>
+        
+        <hr style="border: none; border-top: 1px solid rgba(255, 255, 255, 0.1); margin: 5px 0;">
+
+        <div onclick="window.open('${docsUrl()}', '_blank'); closeDropdownMenu();" style="cursor: pointer; padding: 10px 15px; transition: background-color 0.2s; display: flex; align-items: center; justify-content: space-between;" 
+            onmouseover="this.style.backgroundColor='rgba(100, 100, 100, 0.5)'" 
+            onmouseout="this.style.backgroundColor='transparent'">
+            <div style="display: flex; align-items: center;">
+                <i class="fa-solid fa-book" style="margin-right: 10px; color: #cccccc; width: 16px;"></i>
+                <span>Documentation</span>
+            </div>
+            <i class="fa-solid fa-external-link-alt" style="font-size: 0.7em; color: #888888;"></i>
+        </div>
+
+        <div onclick="window.open('https://github.com/ohAnd/ha_addons/blob/master/eos_connect/CHANGELOG.md', '_blank'); closeDropdownMenu();" style="cursor: pointer; padding: 10px 15px; transition: background-color 0.2s; display: flex; align-items: center; justify-content: space-between;" 
+            onmouseover="this.style.backgroundColor='rgba(100, 100, 100, 0.5)'" 
+            onmouseout="this.style.backgroundColor='transparent'">
+            <div style="display: flex; align-items: center;">
+                <i class="fa-solid fa-file-text" style="margin-right: 10px; color: #cccccc; width: 16px;"></i>
+                <span>Changelog</span>
+            </div>
+            <i class="fa-solid fa-external-link-alt" style="font-size: 0.7em; color: #888888;"></i>
+        </div>
+        <div onclick="sendBugReport(); closeDropdownMenu();" style="cursor: pointer; padding: 10px 15px; transition: background-color 0.2s; display: flex; align-items: center;" 
+            onmouseover="this.style.backgroundColor='rgba(100, 100, 100, 0.5)'" 
+            onmouseout="this.style.backgroundColor='transparent'">
+            <div style="display: flex; align-items: center;">
+                <i class="fa-solid fa-bug" style="margin-right: 10px; color: #cccccc; width: 16px;"></i>
+                <span>Bug Report</span>
+            </div>
+        </div>
+
+        <div id="info-menu-item" onclick="showInfoMenu('${version}', '${backend}', '${granularity}'); closeDropdownMenu();" style="cursor: pointer; padding: 10px 15px; transition: background-color 0.2s; display: flex; align-items: center;" 
+            onmouseover="this.style.backgroundColor='rgba(100, 100, 100, 0.5)'" 
+            onmouseout="this.style.backgroundColor='transparent'">
+            <i class="fa-solid fa-info-circle" style="margin-right: 10px; color: #cccccc; width: 16px;"></i>
+            <span>Info</span>
+        </div>
+    `;
+
+    // Find the menu icon parent container to position relative to it
+    const menuIcon = document.getElementById('current_header_left');
+    const parentBox = menuIcon.closest('.top-box');
+
+    // Add relative positioning to parent if not already present
+    if (getComputedStyle(parentBox).position === 'static') {
+        parentBox.style.position = 'relative';
+    }
+
+    // Append dropdown to parent container
+    parentBox.appendChild(dropdown);
+
+    // Update dropdown notifications using centralized system
+    if (typeof MenuNotifications !== 'undefined') {
+        MenuNotifications.updateDropdown();
+    }
+
+    // Add click outside listener to close dropdown
+    setTimeout(() => {
+        document.addEventListener('click', handleClickOutside, true);
+    }, 0);
+}
+
+/**
+ * Close dropdown menu
+ */
+function closeDropdownMenu() {
+    const dropdown = document.getElementById('main-dropdown-menu');
+    if (dropdown) {
+        dropdown.remove();
+        document.removeEventListener('click', handleClickOutside, true);
+    }
+}
+
+/**
+ * Hamburger Menu Dot Controller - Simple State-Aware System
+ * Knows exactly what's displayed and only changes when needed
+ */
+const MenuNotifications = {
+    displayedColor: null, // What's actually displayed: null, 'red', 'orange', 'white', 'gray'
+    _configRestartPending: false, // True when config restart is pending (protects orange from logging clear)
+
+    /**
+     * Initialize the notification system
+     */
+    init() {
+        console.log('[MenuNotifications] Simple state-aware system initialized');
+    },
+
+    /**
+     * Show a dot with specific color (external interface)
+     * Priority order: red > orange > white > gray > none
+     * @param {string|null} requestedColor - 'red', 'orange', 'white', 'gray', or null
+     */
+    showDot(requestedColor) {
+        // console.log(`[MenuNotifications] Request: show ${requestedColor}, currently displaying: ${this.displayedColor}`);
+
+        // Determine what should be displayed based on priority
+        let targetColor = this.getTargetColor(requestedColor);
+
+        // Only update if the target is different from what's displayed
+        if (targetColor !== this.displayedColor) {
+            console.log(`[MenuNotifications] State change needed: '${this.displayedColor}' → '${targetColor}'`);
+            this.displayedColor = targetColor;
+            this.renderDot();
+        } else {
+            // console.log(`[MenuNotifications] No change needed - already displaying '${this.displayedColor}'`);
+        }
+    },
+
+    /**
+     * Determine target color based on priority rules
+     * Priority: red > orange > blue > white > gray > null
+     * Note: null can only clear colors with equal or lower priority
+     */
+    getTargetColor(requestedColor) {
+        // Priority map (higher number = higher priority)
+        const priorities = {
+            'red': 5,
+            'orange': 4,
+            'blue': 3,
+            'white': 2,
+            'gray': 1,
+            null: 0,
+            undefined: 0
+        };
+        
+        const currentPriority = priorities[this.displayedColor] || 0;
+        const requestedPriority = priorities[requestedColor] || 0;
+        
+        // Only change if requested priority is higher or equal
+        if (requestedPriority >= currentPriority) {
+            return requestedColor;
+        }
+        
+        // Keep current color if it has higher priority
+        return this.displayedColor;
+    },
+
+    /**
+     * Render the dot based on displayedColor (only called when state changes)
+     */
+    renderDot() {
+        const menuElement = document.getElementById('current_header_left');
+        if (!menuElement) {
+            console.log(`[MenuNotifications] Menu element not found`);
+            return;
+        }
+
+        // Always remove existing dot first (clean slate)
+        const existingDot = menuElement.querySelector('.notification-dot');
+        if (existingDot) {
+            existingDot.remove();
+        }
+
+        // Add new dot if needed
+        if (this.displayedColor) {
+            const colors = {
+                'red': 'rgb(220, 53, 69)',
+                'orange': 'rgb(255, 193, 7)',
+                'blue': 'rgb(74, 158, 255)',
+                'white': 'rgb(255, 255, 255)',
+                'gray': 'rgb(136, 136, 136)'
+            };
+
+            const dotColor = colors[this.displayedColor];
+            if (dotColor) {
+                const dot = document.createElement('div');
+                dot.className = 'notification-dot';
+                dot.style.cssText = `
+                    position: absolute;
+                    top: -2px;
+                    right: -2px;
+                    width: 6px;
+                    height: 6px;
+                    background-color: ${dotColor};
+                    border-radius: 50%;
+                    /* border: 1px solid darkgray; optional border */
+                    z-index: 10;
+                    pointer-events: none;
+                `;
+                menuElement.appendChild(dot);
+                console.log(`[MenuNotifications] Rendered ${this.displayedColor} dot`);
+            }
+        } else {
+            console.log(`[MenuNotifications] Removed dot (no color)`);
+        }
+    },
+
+    /**
+     * Update dropdown menu notifications
+     */
+    updateDropdown() {
+        const dropdown = document.getElementById('main-dropdown-menu');
+        if (!dropdown) return;
+
+        // Only update Alarms menu item (not Logs)
+        const alarmsItem = dropdown.querySelector('div[onclick*="showAlarmsMenu"]');
+        if (alarmsItem) {
+            // Convert our color system to old status system for dropdown
+            let status = null;
+            if (this.displayedColor === 'red') status = 'error';
+            else if (this.displayedColor === 'orange' && !this._configRestartPending) status = 'warning';
+
+            this.addDropdownNotification(alarmsItem, status);
+        }
+
+        // Add orange dot to Configuration menu item if restart pending
+        const configItem = dropdown.querySelector('div[onclick*="showConfigurationMenu"]');
+        if (configItem) {
+            this.addDropdownNotification(configItem, this._configRestartPending ? 'warning' : null);
+        }
+
+        // Add blue dot to Info menu item if update available
+        const infoItem = dropdown.querySelector('#info-menu-item');
+        if (infoItem && this.displayedColor === 'blue') {
+            this.addDropdownNotification(infoItem, 'update');
+        }
+
+        // Ensure Logs menu item has no notification dot
+        const logsItem = dropdown.querySelector('div[onclick*="showLogsMenu"]');
+        if (logsItem) {
+            const existingDot = logsItem.querySelector('.dropdown-notification-dot');
+            if (existingDot) {
+                existingDot.remove();
+            }
+        }
+    },
+
+    /**
+     * Add notification dot to dropdown menu item
+     * @param {Element} menuItem - The menu item element
+     * @param {string|null} status - The notification status
+     */
+    addDropdownNotification(menuItem, status) {
+        // Remove existing notification dot
+        const existingDot = menuItem.querySelector('.dropdown-notification-dot');
+        if (existingDot) {
+            existingDot.remove();
+        }
+
+        // Add new notification dot if needed
+        if (status) {
+            let dotColor;
+            if (status === 'error') dotColor = '#dc3545';
+            else if (status === 'warning') dotColor = '#ffc107';
+            else if (status === 'update') dotColor = '#4a9eff';
+            
+            if (dotColor) {
+                const dot = document.createElement('div');
+                dot.className = 'dropdown-notification-dot';
+                dot.style.cssText = `
+                    width: 8px;
+                    height: 8px;
+                    background-color: ${dotColor};
+                    border-radius: 50%;
+                    margin-left: auto;
+                    margin-right: 8px;
+                    flex-shrink: 0;
+                    border: 1px solid rgba(255,255,255,0.2);
+                `;
+
+                menuItem.appendChild(dot);
+            }
+        }
+    },
+
+    /**
+     * Restore notification after menu element changes (only if actually missing)
+     */
+    restoreAfterMenuChange() {
+        // Small delay to ensure DOM is updated
+        setTimeout(() => {
+            if (this.displayedColor) {
+                // Check if dot actually exists before restoring
+                const menuElement = document.getElementById('current_header_left');
+                const existingDot = menuElement ? menuElement.querySelector('.notification-dot') : null;
+
+                if (!existingDot) {
+                    console.log(`[MenuNotifications] Dot missing, restoring ${this.displayedColor} dot`);
+                    this.renderDot();
+                } else {
+                    console.log(`[MenuNotifications] Dot already exists, no restore needed`);
+                }
+            }
+        }, 50);
+    },
+
+    /**
+     * Show blue dot for update available
+     * Won't override higher priority colors (red, orange)
+     */
+    showUpdateDot() {
+        this.showDot('blue');
+    },
+
+    /**
+     * Hide blue dot for updates
+     * Forcefully removes blue dot if it's showing
+     */
+    hideUpdateDot() {
+        if (this.displayedColor === 'blue') {
+            // Directly set to null, bypassing priority check
+            this.displayedColor = null;
+            this.renderDot();
+            console.log('[MenuNotifications] Blue dot forcefully removed');
+        }
+    },
+    
+    /**
+     * Clear logging-related dots (red/orange only)
+     * Won't touch blue (update) dots or config-restart orange dots
+     */
+    clearLoggingDot() {
+        if (this.displayedColor === 'orange' && this._configRestartPending) {
+            console.log('[MenuNotifications] Keeping orange dot - config restart pending');
+            return;
+        }
+        if (this.displayedColor === 'red' || this.displayedColor === 'orange') {
+            this.displayedColor = null;
+            this.renderDot();
+            console.log('[MenuNotifications] Logging dot cleared (was: red/orange)');
+        } else {
+            console.log('[MenuNotifications] Not clearing dot - not a logging color (current: ' + this.displayedColor + ')');
+        }
+    },
+
+    /**
+     * Set or clear the config restart-pending state.
+     * When pending, shows an orange dot that logging won't clear.
+     * @param {boolean} pending - True to show restart dot, false to clear
+     */
+    setRestartPending(pending) {
+        this._configRestartPending = pending;
+        if (pending) {
+            this.showDot('orange');
+            console.log('[MenuNotifications] Config restart pending - orange dot protected');
+        } else {
+            this._configRestartPending = false;
+            if (this.displayedColor === 'orange') {
+                this.displayedColor = null;
+                this.renderDot();
+            }
+            console.log('[MenuNotifications] Config restart cleared');
+        }
+    }
+};
+
+// Initialize and make globally available
+MenuNotifications.init();
+window.MenuNotifications = MenuNotifications;
+
+/**
+ * Handle clicks outside dropdown to close it
+ */
+function handleClickOutside(event) {
+    const dropdown = document.getElementById('main-dropdown-menu');
+    const menuIcon = document.getElementById('current_header_left');
+
+    if (dropdown && !dropdown.contains(event.target) && !menuIcon.contains(event.target)) {
+        closeDropdownMenu();
+    }
+}
+
+/**
+ * Show alarms menu using LoggingManager
+ */
+function showAlarmsMenu() {
+    if (loggingManager) {
+        loggingManager.showAlertsPanel();
+    } else {
+        overlayMenu("Alarms", "Logging system not initialized", false);
+        setTimeout(() => closeOverlayMenu(false), 2000);
+    }
+}
+
+/**
+ * Show override controls menu using modern full-screen overlay
+ */
+function showOverrideControlsMenu() {
+    if (controlsManager) {
+        controlsManager.showOverrideMenuFullScreen();
+    } else {
+        showFullScreenOverlay("Override Controls", "<div style='text-align: center; color: #888; padding: 20px;'>Controls system not initialized</div>");
+        setTimeout(() => closeFullScreenOverlay(), 2000);
+    }
+}
+
+/**
+ * Show PV auto-scaling menu using StatisticsManager
+ *
+ * The same overlay the Statistics tile's badges open. It is reachable from the menu too
+ * because those badges are only filled in after the first optimization cycle, which is
+ * exactly when a user wants to check whether autoscaling is collecting.
+ */
+function showPvAutoscalingMenu() {
+    if (typeof statisticsManager !== 'undefined' && statisticsManager) {
+        statisticsManager.showPvAutoscalingOverlay();
+    } else {
+        showFullScreenOverlay("PV Auto-Scaling", "<div style='text-align: center; color: #888; padding: 20px;'>Statistics system not initialized</div>");
+        setTimeout(() => closeFullScreenOverlay(), 2000);
+    }
+}
+
+/**
+ * Show battery overview menu using BatteryManager
+ */
+function showBatteryOverviewMenu() {
+    if (batteryManager) {
+        batteryManager.showBatteryOverview();
+    } else {
+        showFullScreenOverlay("Battery Overview", "<div style='text-align: center; color: #888; padding: 20px;'>Battery system not initialized</div>");
+        setTimeout(() => closeFullScreenOverlay(), 2000);
+    }
+}
+
+/**
+ * Show logs menu using LoggingManager
+ */
+function showLogsMenu() {
+    if (loggingManager) {
+        loggingManager.showLogsPanel();
+    } else {
+        overlayMenu("Logs", "Logging system not initialized", false);
+        setTimeout(() => closeOverlayMenu(false), 2000);
+    }
+}
+
+/**
+ * Show info menu using modern full-screen overlay
+ */
+function showInfoMenu(version, backend, granularity) {
+    if (backend == "local_evopt") {
+        backend = "Local EVOpt (built-in)";
+    } else if (backend == "evopt") {
+        backend = "EVOpt @ EVCC";
+    } else {
+        backend = "EOS@akkudoktor";
+    }
+    granularity = granularity == "900" ? "15 min intervals" : "60 min intervals";
+    
+    // Build combined version/update status section
+    let versionSection = '';
+    if (typeof updateBannerManager !== 'undefined') {
+        const updateStatus = updateBannerManager.getStatus();
+        const isUpdateCheckEnabled = updateStatus && updateStatus.enabled;
+        const hasUpdate = isUpdateCheckEnabled && updateStatus.update_available;
+        const isDismissed = hasUpdate && updateBannerManager.isDismissed();
+        
+        // Color and icon logic
+        const borderColor = hasUpdate ? '#4a9eff' : '#17a2b8';
+        const iconColor = hasUpdate ? '#4a9eff' : '#17a2b8';
+        const statusIcon = hasUpdate ? 'fa-arrow-circle-up' : 'fa-code-branch';
+        const titleText = hasUpdate ? 'Version & Update Status' : 'Version Information';
+        
+        versionSection = `
+            <!-- Combined Version & Update Section -->
+            <div style="background-color: rgba(0,0,0,0.3); border-radius: 8px; padding: 30px; margin-bottom: 25px; border-left: 4px solid ${borderColor};">
+                <div style="font-size: 1.2em; color: ${iconColor}; margin-bottom: 20px; font-weight: bold;">
+                    <i class="fas ${statusIcon}" style="margin-right: 10px;"></i>${titleText}
+                </div>
+                
+                ${!isUpdateCheckEnabled ? `
+                    <!-- Update Check Disabled (HA Add-on) -->
+                    <div style="display: flex; flex-direction: column; align-items: center; gap: 15px;">
+                        <div style="font-size: 0.85em; color: #888; margin-bottom: 5px;">Current Version</div>
+                        <div style="font-size: 1.4em; color: #fff; font-weight: bold; background-color: rgba(255,255,255,0.1); padding: 12px 20px; border-radius: 6px;">
+                            ${version}
+                        </div>
+                        
+                        <div style="background-color: rgba(108, 117, 125, 0.15); border: 1px solid rgba(108, 117, 125, 0.4); border-radius: 6px; padding: 10px 16px; display: inline-flex; align-items: center; gap: 8px; margin-top: 10px;">
+                            <i class="fas fa-info-circle" style="color: #6c757d;"></i>
+                            <span style="color: #6c757d; font-weight: 600;">Update Check: Disabled (Home Assistant Add-on)</span>
+                        </div>
+                    </div>
+                ` : hasUpdate ? `
+                    <!-- Update Available Layout -->
+                    <div style="display: flex; flex-direction: column; align-items: center; gap: 15px;">
+                        <!-- Version Comparison -->
+                        <div style="display: flex; flex-direction: column; gap: 8px; width: 100%;">
+                            <!-- Labels -->
+                            <div class="version-labels-container">
+                                <div class="version-label">Current</div>
+                                <div class="version-label-spacer"></div>
+                                <div class="version-label">Latest</div>
+                            </div>
+                            
+                            <!-- Version Boxes with Arrow -->
+                            <div class="version-comparison-container">
+                                <div class="version-box">
+                                    ${version}
+                                </div>
+                                
+                                <div class="version-arrow">
+                                    <i class="fas fa-arrow-right version-arrow-horizontal"></i>
+                                    <i class="fas fa-arrow-down version-arrow-vertical"></i>
+                                </div>
+                                
+                                <div class="version-box version-box-latest">
+                                    ${updateStatus.latest_version}
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Status Badge -->
+                        <div style="background-color: rgba(74, 158, 255, 0.15); border: 1px solid rgba(74, 158, 255, 0.4); border-radius: 6px; padding: 10px 16px; display: inline-flex; align-items: center; gap: 8px; margin-top: 10px;">
+                            <i class="fas fa-arrow-circle-up" style="color: #4a9eff;"></i>
+                            <span style="color: #4a9eff; font-weight: 600;">${isDismissed ? 'Update Available (Dismissed)' : 'Update Available'}</span>
+                        </div>
+                        
+                        ${isDismissed ? `
+                            <div style="background-color: rgba(255, 193, 7, 0.1); border: 1px solid rgba(255, 193, 7, 0.3); border-radius: 6px; padding: 10px 16px; display: inline-flex; align-items: center; gap: 8px;">
+                                <i class="fas fa-info-circle" style="color: #ffc107;"></i>
+                                <span style="color: #ffc107; font-size: 0.9em;">Notification dismissed</span>
+                            </div>
+                        ` : ''}
+                        
+                        <!-- Actions -->
+                        <div style="display: flex; justify-content: center; gap: 12px; flex-wrap: wrap; margin-top: 15px;">
+                            <a href="https://github.com/Ohand/EOS_connect/pkgs/container/eos_connect" target="_blank"
+                               style="padding: 10px 20px; background-color: #4a9eff; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 0.9em; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; transition: all 0.2s ease;"
+                               onmouseover="this.style.backgroundColor='#357abd'; this.style.transform='translateY(-2px)'"
+                               onmouseout="this.style.backgroundColor='#4a9eff'; this.style.transform='translateY(0)'">
+                                <i class="fas fa-external-link-alt"></i> View on GHCR
+                            </a>
+                            
+                            ${!isDismissed ? `
+                                <button id="dismiss-update-btn"
+                                   style="padding: 10px 20px; background-color: rgba(255,255,255,0.1); color: white; border: 1px solid rgba(255,255,255,0.3); border-radius: 6px; cursor: pointer; font-size: 0.9em; display: inline-flex; align-items: center; gap: 6px; transition: all 0.2s ease;"
+                                   onmouseover="this.style.backgroundColor='rgba(255,255,255,0.2)'"
+                                   onmouseout="this.style.backgroundColor='rgba(255,255,255,0.1)'">
+                                    <i class="fas fa-times-circle"></i> Dismiss
+                                </button>
+                            ` : `
+                                <button id="undismiss-update-btn"
+                                   style="padding: 10px 20px; background-color: rgba(74, 158, 255, 0.2); color: #4a9eff; border: 1px solid rgba(74, 158, 255, 0.4); border-radius: 6px; cursor: pointer; font-size: 0.9em; display: inline-flex; align-items: center; gap: 6px; transition: all 0.2s ease;"
+                                   onmouseover="this.style.backgroundColor='rgba(74, 158, 255, 0.3)'"
+                                   onmouseout="this.style.backgroundColor='rgba(74, 158, 255, 0.2)'">
+                                    <i class="fas fa-bell"></i> Show Notification
+                                </button>
+                            `}
+                        </div>
+                    </div>
+                ` : `
+                    <!-- Up to Date Layout -->
+                    <div style="display: flex; flex-direction: column; align-items: center; gap: 15px;">
+                        <div style="font-size: 0.85em; color: #888; margin-bottom: 5px;">Current Version</div>
+                        <div style="font-size: 1.4em; color: #fff; font-weight: bold; background-color: rgba(255,255,255,0.1); padding: 12px 20px; border-radius: 6px;">
+                            ${version}
+                        </div>
+                        
+                        <div style="background-color: rgba(40, 167, 69, 0.15); border: 1px solid rgba(40, 167, 69, 0.4); border-radius: 6px; padding: 10px 16px; display: inline-flex; align-items: center; gap: 8px; margin-top: 10px;">
+                            <i class="fas fa-check-circle" style="color: #28a745;"></i>
+                            <span style="color: #28a745; font-weight: 600;">Up to Date</span>
+                        </div>
+                    </div>
+                `}
+            </div>
+        `;
+    } else {
+        // Fallback if update checker not available
+        versionSection = `
+            <div style="background-color: rgba(0,0,0,0.3); border-radius: 8px; padding: 30px; margin-bottom: 25px; border-left: 4px solid #17a2b8;">
+                <div style="font-size: 1.2em; color: #17a2b8; margin-bottom: 15px; font-weight: bold;">
+                    <i class="fas fa-code-branch" style="margin-right: 10px;"></i>Version Information
+                </div>
+                <div style="font-size: 0.9em; color: #888; margin-bottom: 15px;">Currently installed version:</div>
+                <div style="font-size: 1.4em; color: #fff; font-weight: bold; background-color: rgba(255,255,255,0.1); padding: 12px 20px; border-radius: 6px; display: inline-block;">
+                    ${version}
+                </div>
+            </div>
+        `;
+    }
+    
+    const header = `
+        <div style="display: flex; align-items: center; gap: 10px;">
+            <i class="fas fa-info-circle" style="color: #17a2b8;"></i>
+            <span>EOS connect Information</span>
+        </div>
+    `;
+
+    const content = `
+        <div style="height: calc(100% - 20px); overflow-y: auto; margin-top: 10px; text-align: center;">
+            <!-- Backend & Core Section -->
+            <div style="background-color: rgba(0,0,0,0.3); border-radius: 8px; padding: 30px; margin-bottom: 25px; border-left: 4px solid #7017b8ff;">
+                <div style="font-size: 1.2em; color: #cb6bd8ff; margin-bottom: 15px; font-weight: bold;">
+                    <i class="fas fa-brain" style="margin-right: 10px;"></i>Backend & Core Information
+                </div>
+                <div style="font-size: 0.9em; color: #888; margin-bottom: 15px;">Currently selected backend:</div>
+                <div style="font-size: 1.4em; color: #fff; font-weight: bold; background-color: rgba(255,255,255,0.1); padding: 12px 20px; border-radius: 6px; display: inline-block;">
+                    ${backend}
+                </div>
+                <div style="font-size: 0.9em; color: #888; margin-top: 15px; margin-bottom: 15px;">Currently selected optimization granularity:</div>
+                <div style="font-size: 1.4em; color: #fff; font-weight: bold; background-color: rgba(255,255,255,0.1); padding: 12px 20px; border-radius: 6px; display: inline-block;">
+                    ${granularity}
+                </div>
+            </div>
+            
+            ${versionSection}
+            <!-- Links Section -->
+            <div style="background-color: rgba(0,0,0,0.3); border-radius: 8px; padding: 30px; border-left: 4px solid #28a745;">
+                <div style="font-size: 1.2em; color: #28a745; margin-bottom: 20px; font-weight: bold;">
+                    <i class="fas fa-external-link-alt" style="margin-right: 10px;"></i>Project Resources
+                </div>
+                
+                <div style="display: flex; justify-content: center; gap: 30px; flex-wrap: wrap;">
+                    <!-- GitHub Repository -->
+                    <a href="https://github.com/ohAnd/EOS_connect" target="_blank" 
+                       style="color: inherit; text-decoration: none; display: flex; flex-direction: column; align-items: center; padding: 20px; background-color: rgba(255,255,255,0.05); border-radius: 8px; transition: all 0.3s ease; min-width: 120px;"
+                       onmouseover="this.style.backgroundColor='rgba(255,255,255,0.1)'; this.style.transform='translateY(-2px)'"
+                       onmouseout="this.style.backgroundColor='rgba(255,255,255,0.05)'; this.style.transform='translateY(0)'">
+                        <i class="fa-brands fa-github" style="font-size: 2.5em; margin-bottom: 10px; color: #fff;"></i>
+                        <span style="font-size: 0.9em; font-weight: bold;">Repository</span>
+                        <span style="font-size: 0.75em; color: #888; margin-top: 5px;">Source Code</span>
+                    </a>
+                    
+                    <!-- Changelog -->
+                    <a href="https://github.com/ohAnd/ha_addons/blob/master/eos_connect/CHANGELOG.md" target="_blank" 
+                       style="color: inherit; text-decoration: none; display: flex; flex-direction: column; align-items: center; padding: 20px; background-color: rgba(255,255,255,0.05); border-radius: 8px; transition: all 0.3s ease; min-width: 120px;"
+                       onmouseover="this.style.backgroundColor='rgba(255,255,255,0.1)'; this.style.transform='translateY(-2px)'"
+                       onmouseout="this.style.backgroundColor='rgba(255,255,255,0.05)'; this.style.transform='translateY(0)'">
+                        <i class="fas fa-file-text" style="font-size: 2.5em; margin-bottom: 10px; color: #ffc107;"></i>
+                        <span style="font-size: 0.9em; font-weight: bold;">Changelog</span>
+                        <span style="font-size: 0.75em; color: #888; margin-top: 5px;">Version History</span>
+                    </a>
+                    
+                    <!-- Bug Reports -->
+                    <a href="https://github.com/ohAnd/EOS_connect/issues" target="_blank" 
+                       style="color: inherit; text-decoration: none; display: flex; flex-direction: column; align-items: center; padding: 20px; background-color: rgba(255,255,255,0.05); border-radius: 8px; transition: all 0.3s ease; min-width: 120px;"
+                       onmouseover="this.style.backgroundColor='rgba(255,255,255,0.1)'; this.style.transform='translateY(-2px)'"
+                       onmouseout="this.style.backgroundColor='rgba(255,255,255,0.05)'; this.style.transform='translateY(0)'">
+                        <i class="fas fa-bug" style="font-size: 2.5em; margin-bottom: 10px; color: #dc3545;"></i>
+                        <span style="font-size: 0.9em; font-weight: bold;">Issues</span>
+                        <span style="font-size: 0.75em; color: #888; margin-top: 5px;">Bug Reports</span>
+                    </a>
+                </div>
+            </div>
+            
+            <!-- Footer -->
+            <div style="margin-top: 25px; padding: 20px; color: #888; font-size: 0.8em;">
+                <i class="fas fa-heart" style="color: #dc3545; margin-right: 5px;"></i>
+                Made with care for the EOS ecosystem
+            </div>
+        </div>
+    `;
+
+    showFullScreenOverlay(header, content);
+    
+    // Set up dismiss/undismiss button event listeners if update section exists
+    setTimeout(() => {
+        const dismissBtn = document.getElementById('dismiss-update-btn');
+        const undismissBtn = document.getElementById('undismiss-update-btn');
+        
+        if (dismissBtn && typeof updateBannerManager !== 'undefined') {
+            dismissBtn.addEventListener('click', () => {
+                console.log('[INFO-PAGE] Dismiss update button clicked');
+                updateBannerManager.dismissBanner();
+                closeFullScreenOverlay();
+                // Reopen Info page to show updated state (without menu flash)
+                setTimeout(() => {
+                    if (typeof data_controls !== 'undefined') {
+                        showInfoMenu(
+                            data_controls["eos_connect_version"],
+                            data_controls["used_optimization_source"],
+                            data_controls["used_time_frame_base"]
+                        );
+                    }
+                }, 200);
+            });
+        }
+        
+        if (undismissBtn && typeof updateBannerManager !== 'undefined') {
+            undismissBtn.addEventListener('click', () => {
+                console.log('[INFO-PAGE] Undismiss update button clicked');
+                // Remove dismissal from localStorage
+                localStorage.removeItem(updateBannerManager.dismissedVersionKey);
+                // Re-check for updates to show banner again
+                updateBannerManager.checkForUpdates();
+                closeFullScreenOverlay();
+            });
+        }
+    }, 50); // Small delay to ensure DOM is ready
+}
+
+/**
+ * Create full-screen overlay for logs with responsive margins
+ */
+function showFullScreenOverlay(header, content, close = true) {
+    // Create overlay if it doesn't exist
+    let overlay = document.getElementById('full_screen_overlay');
+    if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.id = 'full_screen_overlay';
+        overlay.style.display = 'none';
+        document.body.appendChild(overlay);
+    }
+
+    // Every dimension below is a class in style.css, including the phone breakpoint.
+    // It used to be inline styles built from isMobile(), which is read once - so an
+    // overlay opened in portrait kept its phone paddings and font size after the
+    // device was turned, and nothing re-rendered it. A media query does not have
+    // that problem.
+    overlay.innerHTML = `
+        <div class="fs-overlay-card">
+            <!-- Header -->
+            <div id="full_screen_header">
+                ${header}
+                ${close ? `<button class="fs-overlay-close" onclick="closeFullScreenOverlay()" aria-label="Close">\u00d7</button>` : ''}
+            </div>
+
+            <!-- Content -->
+            <div id="full_screen_content">
+                ${content}
+            </div>
+        </div>
+    `;
+
+    overlay.style.display = 'flex';
+
+    // Block background scrolling
+    document.body.style.overflow = 'hidden';
+
+    // Add escape key listener
+    const escapeHandler = (e) => {
+        if (e.key === 'Escape') {
+            closeFullScreenOverlay();
+        }
+    };
+    document.addEventListener('keydown', escapeHandler);
+    overlay.escapeHandler = escapeHandler; // Store for cleanup
+}
+
+/**
+ * Close full-screen overlay
+ * @param {number} waittime - Optional delay before closing (ms)
+ */
+function closeFullScreenOverlay(waittime = 0) {
+    const overlay = document.getElementById('full_screen_overlay');
+    if (overlay) {
+        setTimeout(() => {
+            overlay.style.display = 'none';
+        }, waittime);
+
+        // Restore background scrolling
+        document.body.style.overflow = '';
+
+        // Remove escape key listener
+        if (overlay.escapeHandler) {
+            document.removeEventListener('keydown', overlay.escapeHandler);
+        }
+        // Stop auto-refresh when closing overlay
+        if (typeof loggingManager !== 'undefined' && loggingManager.stopAutoRefresh) {
+            loggingManager.stopAutoRefresh();
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+

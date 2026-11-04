@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.7.2/css/all.min.css">
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EOS connect board</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels"></script>
+    <link rel="stylesheet" href="css/style.css?v={{ asset_version }}">
+    <link rel="stylesheet" href="css/config.css?v={{ asset_version }}">
+    <link rel="stylesheet" href="css/wizard.css?v={{ asset_version }}">
+    <link href="https://fonts.cdnfonts.com/css/seven-segment" rel="stylesheet">
+
+</head>
+
+<body data-docs-base="{{ docs_base_url }}">
+    <div id="overlay"
+        style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0, 0, 0, 0.8); color: white; display: flex; justify-content: center; align-items: center; z-index: 1000;">
+        <div style="text-align: center; padding: 2em; position: relative;">
+            <p style="font-size: 2.5em; margin-bottom: 20px; text-align: center;">EOS connect</p>
+            <p id="waiting_text" style="font-size: 1.5em; margin-bottom: 20px; text-align: center;">loading ...
+            </p>
+            <p id="waiting_error_text"
+                style="font-size: 1.0em; font-weight: bold;  margin-bottom: 20px; text-align: center; color:rgb(241, 177, 0)">
+                ...</p>
+
+            <!-- Startup progress - fed by /api/boot/status while the app is still
+                 coming up. The web server now answers long before the interfaces
+                 are ready, so this is what fills that window. -->
+            <div id="boot-progress" style="display: none; max-width: 480px; margin: 0 auto 20px auto;">
+                <div style="
+                    height: 6px;
+                    background: rgba(255, 255, 255, 0.15);
+                    border-radius: 3px;
+                    overflow: hidden;">
+                    <div id="boot-progress-bar" style="
+                        height: 100%;
+                        width: 0%;
+                        background: #4a9eff;
+                        border-radius: 3px;
+                        transition: width 0.4s ease;"></div>
+                </div>
+                <p id="boot-progress-label" style="
+                    font-size: 0.95em;
+                    color: #ccc;
+                    margin: 10px 0 0 0;
+                    text-align: center;"></p>
+            </div>
+
+            <!-- Startup failed on a setting the user has to correct. The config UI
+                 is reachable the whole time this is showing - that is the point. -->
+            <div id="boot-fatal" style="
+                display: none;
+                background: rgba(211, 47, 47, 0.15);
+                border: 2px solid rgba(211, 47, 47, 0.4);
+                border-radius: 8px;
+                padding: 16px 20px;
+                margin: 0 auto 20px auto;
+                max-width: 520px;
+                text-align: left;">
+                <div style="margin-bottom: 10px;">
+                    <i class="fas fa-triangle-exclamation"
+                        style="color: #d32f2f; margin-right: 8px; font-size: 1.2em;"></i>
+                    <span style="color: #ff6b6b; font-weight: bold;">Startup stopped - check the configuration</span>
+                </div>
+                <p id="boot-fatal-message" style="color: #ccc; font-size: 0.9em; margin: 0 0 12px 0;"></p>
+                <p style="color: #ccc; font-size: 0.85em; margin: 0 0 12px 0;">
+                    Optimization is paused. Correct the setting below, then restart EOS Connect.
+                </p>
+                <button id="boot-fatal-config-btn" style="
+                    background-color: rgba(255, 255, 255, 0.1);
+                    color: white;
+                    border: 2px solid rgba(255, 255, 255, 0.3);
+                    border-radius: 8px;
+                    padding: 10px 18px;
+                    font-size: 0.9em;
+                    cursor: pointer;
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 8px;">
+                    <i class="fas fa-gear"></i> Open configuration
+                </button>
+            </div>
+
+            <!-- Startup Errors Panel -->
+            <div id="startup-errors-panel" style="
+                display: none;
+                background: rgba(211, 47, 47, 0.15);
+                border: 2px solid rgba(211, 47, 47, 0.4);
+                border-radius: 8px;
+                padding: 16px 20px;
+                margin-top: 24px;
+                margin-bottom: 16px;
+                max-width: 580px;
+                margin-left: auto;
+                margin-right: auto;
+                text-align: left;
+                max-height: 350px;
+                overflow-y: auto;
+            ">
+                <div style="margin-bottom: 12px;">
+                    <i class="fas fa-exclamation-circle"
+                        style="color: #d32f2f; margin-right: 8px; font-size: 1.2em;"></i>
+                    <span style="color: #ff6b6b; font-weight: bold; font-size: 0.95em;">Startup Issues Found</span>
+                </div>
+                <div id="startup-errors-list" style="font-size: 0.9em;">
+                    <!-- Error items will be inserted here -->
+                </div>
+            </div>
+
+            <div
+                style="border: 4px solid white; border-top: 4px solid gray; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 20px auto;">
+            </div>
+
+            <!-- Restart hint — shown when config was changed but restart not yet done -->
+            <div id="startup-restart-hint" style="
+                display: none;
+                background: rgba(255, 193, 7, 0.15);
+                border: 2px solid rgba(255, 193, 7, 0.4);
+                border-radius: 8px;
+                padding: 14px 20px;
+                margin-top: 24px;
+                margin-bottom: 8px;
+                max-width: 480px;
+                margin-left: auto;
+                margin-right: auto;
+                text-align: center;
+            ">
+                <i class="fas fa-exclamation-triangle" style="color: #ffc107; margin-right: 6px;"></i>
+                <span style="color: #ffc107; font-weight: bold;">Restart required</span>
+                <p style="color: #ccc; font-size: 0.85em; margin: 6px 0 0 0;">
+                    Configuration was changed. Please restart EOS Connect for the new settings to take effect.
+                </p>
+            </div>
+
+            <!-- Startup Log Access Button -->
+            <button id="startup-logs-btn"
+                onclick="if(typeof loggingManager !== 'undefined') { loggingManager.showLogsPanel(); }" style="
+                    background-color: rgba(255, 255, 255, 0.1);
+                    color: white;
+                    border: 2px solid rgba(255, 255, 255, 0.3);
+                    border-radius: 8px;
+                    padding: 12px 20px;
+                    font-size: 0.9em;
+                    cursor: pointer;
+                    margin-top: 30px;
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 8px;
+                    transition: all 0.3s ease;
+                    backdrop-filter: blur(10px);
+                "
+                onmouseover="this.style.backgroundColor='rgba(255, 255, 255, 0.2)'; this.style.borderColor='rgba(255, 255, 255, 0.5)';"
+                onmouseout="this.style.backgroundColor='rgba(255, 255, 255, 0.1)'; this.style.borderColor='rgba(255, 255, 255, 0.3)';"
+                title="View system logs to see what's happening during startup">
+                <i class="fas fa-file-alt"></i>
+                Show Logs
+            </button>
+            <br>
+            <button id="startup-config-btn"
+                onclick="if(typeof showConfigurationMenu === 'function') { showConfigurationMenu(); }" style="
+                    background-color: rgba(74, 158, 255, 0.15);
+                    color: white;
+                    border: 2px solid rgba(74, 158, 255, 0.4);
+                    border-radius: 8px;
+                    padding: 12px 20px;
+                    font-size: 0.9em;
+                    cursor: pointer;
+                    margin-top: 12px;
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 8px;
+                    transition: all 0.3s ease;
+                    backdrop-filter: blur(10px);
+                "
+                onmouseover="this.style.backgroundColor='rgba(74, 158, 255, 0.3)'; this.style.borderColor='rgba(74, 158, 255, 0.7)';"
+                onmouseout="this.style.backgroundColor='rgba(74, 158, 255, 0.15)'; this.style.borderColor='rgba(74, 158, 255, 0.4)';"
+                title="Open configuration to fix connection settings">
+                <i class="fas fa-cog"></i>
+                Change Configuration
+            </button>
+        </div>
+        <div id="version_overlay"
+            style="position: absolute; bottom: 10px; right: 10px; width: 100%; text-align: right; font-size: x-small;">
+            EOS connect version: v00.00.00</div>
+    </div>
+    <div id="overlay_menu" style="display: none;">
+        <div id="overlay_menu_content_wrapper" style="text-align: center; padding: 20px;">
+            <p style="font-size: 1.8em; margin-bottom: 20px;">EOS connect</p>
+            <hr>
+            <p style="font-size: 1.3em; margin-bottom: 20px;" id="overlay_menu_head">Menu Overlay</p>
+            <hr style="border-color: rgba(44, 44, 44, 0.596);">
+            <p style="font-size: 1.2em; margin-bottom: 20px;" id="overlay_menu_content">This is a centered overlay menu.
+            </p>
+            <button id="overlay_menu_close" onclick="closeOverlayMenu(true)"
+                style="padding: 10px 20px; font-size: 1em; background-color: #444; color: white; border: none; border-radius: 5px; cursor: pointer;">Close</button>
+        </div>
+    </div>
+    <style>
+        @keyframes spin {
+            0% {
+                transform: rotate(0deg);
+            }
+
+            100% {
+                transform: rotate(360deg);
+            }
+        }
+    </style>
+
+    <!-- Test Control Panel -->
+    <div id="test_control_panel"
+        style="position: fixed; top: 10px; right: 10px; background: rgba(0,0,0,0.8); color: white; padding: 10px; border-radius: 5px; z-index: 999; display: none; font-size: 12px;">
+        <div style="margin-bottom: 10px; font-weight: bold; cursor: pointer;" onclick="toggleTestPanel()">🧪 Test Mode
+        </div>
+        <div id="test_controls" style="display: none;">
+            <select id="test_scenario_select" onchange="switchTestScenario()"
+                style="width: 100%; margin-bottom: 5px; padding: 2px; background: #333; color: white; border: 1px solid #666;">
+                <option value="live">Central Test Data</option>
+                <option value="override_0">Override Mode 0</option>
+                <option value="override_1">Override Mode 1</option>
+                <option value="override_2">Override Mode 2</option>
+                <option value="single_evcc">Single EVCC</option>
+                <option value="multi_evcc">Multiple EVCC</option>
+                <option value="no_evcc">No EVCC</option>
+            </select>
+            <button onclick="refreshTestData()"
+                style="width: 100%; padding: 3px; background: #444; color: white; border: 1px solid #666; cursor: pointer;">Refresh</button>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="top-boxes">
+            <div class="top-box" id="current_controls_box">
+                <div class="header"><i class="fa-solid fa-battery-full"></i> Current Controls
+                    <span class="header_notification" id="current_header_left"
+                        style="cursor: pointer;left: 10px;min-width: 20px;right: unset;">...</span>
+                    <span class="header_notification" id="current_header_right"
+                        style="cursor: pointer;min-width: 20px;">...</span>
+                </div>
+                <div class="content">
+                    <table style="width: 100%; text-align: left;">
+                        <tr>
+                            <th class="top_box_info_text_head" style="text-align: left;">Overall State</th>
+                            <th style="text-align: right;" id="control_overall"></th>
+                        </tr>
+                        <tr>
+                            <td colspan="2">
+                                <hr>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td class="top_box_info_text" id="control_ac_charge_desc">AC Charge</td>
+                            <td style="text-align: right;" id="control_ac_charge">--</td>
+                        </tr>
+                        <tr>
+                            <td class="top_box_info_text" id="control_dc_charge_desc">DC Charge</td>
+                            <td style="text-align: right;" id="control_dc_charge">--</td>
+                        </tr>
+                        <tr>
+                            <td class="top_box_info_text" id="control_discharge_allowed_desc">Discharge Allowed</td>
+                            <td style="text-align: right;" id="control_discharge_allowed">--</td>
+                        </tr>
+                    </table>
+                </div>
+            </div>
+            <!--
+                Managed loads. Hidden until at least one is configured, so an install
+                without a pool or a pushed heating profile looks exactly as it did.
+            -->
+            <div class="top-box" id="managed_loads_box" style="display: none;">
+                <div class="header"><i class="fa-solid fa-sliders"></i>
+                    <span class="header-title">Managed Loads</span>
+                    <span class="header_notification" id="managed_loads_total"
+                        onclick="showManagedLoadsMenu()"
+                        style="cursor: pointer;min-width: 20px;">...</span>
+                </div>
+                <div class="content">
+                    <table style="width: 100%; text-align: left;">
+                        <tbody id="managed_loads_rows"></tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="top-box">
+                <div class="header"><i id="battery_icon_main"></i> Battery State
+                    <span class="header_notification" id="battery_usable_capacity"
+                        style="cursor: pointer;left: 10px;min-width: 20px;right: unset;">...</span>
+                    <span class="header_notification" id="battery_soc"
+                        style="cursor: pointer; min-width: 20px;">...</span>
+                </div>
+                <div class="content">
+                    <table style="width: 100%; text-align: left;">
+                        <tr id="next_charge_header">
+                            <th class="top_box_info_text_head" style="text-align: left;">Next AC Charge</th>
+                            <th style="text-align: right;" id="next_charge_time">... next charge time</th>
+                        </tr>
+                        <tr>
+                            <td colspan="3">
+                                <hr>
+                            </td>
+                        </tr>
+                        <tr id="next_charge_summary">
+                            <td class="top_box_info_text">Needed Energy</td>
+                            <td colspan="2" style="text-align: right;"><span
+                                    id="next_charge_amount">initializing...</span> /
+                                <span id="next_charge_sum_price">... </span>
+                            </td>
+                        </tr>
+                        <tr id="next_charge_summary_2">
+                            <td class="top_box_info_text">Avg AC Charging Price</td>
+                            <td colspan="2" style="text-align: right;" id="next_charge_avg_price">initializing...
+                            </td>
+                        </tr>
+                        <tr>
+                            <!-- Shortened, with the full phrase on hover: at 30 characters this
+                                 was the longest label in the row and it set the font size for
+                                 every tile, since nothing may grow past the point where it
+                                 wraps. -->
+                            <td class="top_box_info_text"
+                                title="Dynamic maximum AC+DC charge power"><i>Dynamic Max Charge</i></td>
+                            <td colspan="2" style="text-align: right;" id="current_max_charge_dyn">--</td>
+                        </tr>
+                    </table>
+                </div>
+            </div>
+            <div class="top-box">
+                <div class="header"><i class="fa-solid fa-charging-station"></i> eCar Charging
+                    <span class="header_notification" id="evcc_mode" style="left: 10px;right: unset;">...</span>
+                    <span class="header_notification" id="evcc_state">...</span>
+                </div>
+                <div class="content" style="text-align: center;">
+                    <span id="ecar_charging_table_off">no car connected</span>
+                    <table style="width: 100%; text-align: left;" id="ecar_charging_table_single">
+                        <tr>
+                            <!-- <th style="text-align: left;">Vehicle</th> -->
+                            <th class="top_box_info_text_head" style="text-align: left; cursor: help;" colspan="2"
+                                title="name of vehicle in EVCC"><i class="fa-solid fa-car"></i> <span
+                                    id="ecar_charging_name">...</span></th>
+                            <!-- <th style="text-align: right;">SOC </th> -->
+                            <th class="valueChange" style="text-align: right; cursor: help;" colspan="2"
+                                title="eCar SOC"><span id="ecar_charging_soc">--.- %</span> <i
+                                    class="fa-solid fa-car-battery"></i></th>
+                        </tr>
+                        <tr>
+                            <td colspan="4">
+                                <hr>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td style="text-align: right; cursor: help;" class="valueChange" id="ecar_charging_odometer"
+                                title="current vehicle mileage">--- km</td>
+                            <td style="text-align: right;"><i class="fa-solid fa-gauge"> </i></td>
+                            <td style="text-align: left; border-left-width: 1px; border-left-style: solid;"> <i
+                                    class="fa-solid fa-road"></i></td>
+                            <td style="text-align: left; cursor: help;" class="valueChange" style="text-align: right;"
+                                id="ecar_charging_range" title="current vehicle range">--- km</td>
+                        </tr>
+                        <tr>
+                            <td style="text-align: right; cursor: help;" class="valueChange" id="ecar_charging_charged"
+                                title="already charged energy">0.00 kWh</td>
+                            <td style="text-align: right;"><i class="fa-solid fa-right-long"> <i
+                                        class="fa-solid fa-bolt"> </i></td>
+                            <td style="text-align: left; border-left-width: 1px; border-left-style: solid;"> <i
+                                    class="fa-solid fa-bolt"> </i> <i class="fa-solid fa-check"></i></td>
+                            <td style="text-align: left; cursor: help;" class="valueChange"
+                                id="ecar_charging_charged_remain" title="remaining energy to charge">0.00
+                                kWh</td>
+                        </tr>
+                        <tr>
+                            <td style="text-align: right; cursor: help;" class="valueChange" id="ecar_charging_duration"
+                                title="current duration of charging">00:00</td>
+                            <td style="text-align: right;"><i class="fa-solid fa-right-long"></i> <i
+                                    class="fa-solid fa-stopwatch"></i> </td>
+                            <td style="text-align: left; border-left-width: 1px; border-left-style: solid;"> <i
+                                    class="fa-solid fa-clock"></i> <i class="fa-solid fa-check"></i></td>
+                            <td style="text-align: left; cursor: help;" class="valueChange"
+                                id="ecar_charging_duration_remain" title="remaining time until charging is done">00:00
+                            </td>
+                        </tr>
+                    </table>
+                    <table style="width: 100%; text-align: left;" id="ecar_charging_table_multiple">
+                        <!-- will be filled with multiple vehicles -->
+                    </table>
+                </div>
+            </div>
+            <div class="top-box">
+                <div class="header"><i class="fa-solid fa-chart-pie"></i> Statistics
+                    <span class="header_notification" id="statistics_header_left"
+                        style="cursor: pointer;left: 10px;min-width: 20px;right: unset;"
+                        onclick="if(typeof statisticsManager !== 'undefined') statisticsManager.showPvAutoscalingOverlay();"
+                        title="Click to view PV autoscaling details">...</span>
+                    <span class="header_notification" id="statistics_header_right"
+                        style="min-width: 20px; cursor: pointer;"
+                        onclick="if(typeof statisticsManager !== 'undefined') statisticsManager.showPvAutoscalingOverlay();"
+                        title="Click to view PV autoscaling details">...</span>
+                    <!-- Explicit entry point: the yield badges above are only filled in
+                         after the first optimization cycle, which is exactly when a user
+                         wants to check whether autoscaling is collecting. -->
+                    <i class="fa-solid fa-arrows-up-down" id="pv_autoscaling_open"
+                        style="cursor: pointer; margin-left: 8px; opacity: 0.75; font-size: 0.85em;"
+                        onclick="if(typeof statisticsManager !== 'undefined') statisticsManager.showPvAutoscalingOverlay();"
+                        title="PV Auto-Scaling details"></i>
+                </div>
+                <div class="content">
+                    <table style="width: 100%; text-align: left;">
+                        <tr>
+                            <th class="top_box_info_text_head" style="text-align: left;"
+                                title="Expense for the rest of the day">Expense</th>
+                            <th style="text-align: right;" id="expense_summary">0.00 ...</th>
+                        </tr>
+                        <tr>
+                            <td colspan="3">
+                                <hr>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td class="top_box_info_text">Income</td>
+                            <td colspan="2" style="text-align: right;" id="income_summary">0.00
+                                ...</td>
+                        </tr>
+                        <tr>
+                            <td class="top_box_info_text">Feed In</td>
+                            <td colspan="2" style="text-align: right;" id="feed_in_summary">0.0 kWh</td>
+                        </tr>
+                    </table>
+                </div>
+            </div>
+        </div>
+        <div class="bottom-boxes">
+            <div class="left-box">
+                <div class="header"><i class="fa-solid fa-chart-column"></i> Optimization
+                    <span class="header_notification" id="timestamp_next_run"
+                        style="left: 10px;right: unset;">00:00:00</span>
+                    <span class="header_notification" id="mobileview_rotate"
+                        style="right: 6.0em; background-color: inherit;"
+                        title="Rotate your device to landscape for a better view">
+                        <i class="fa-solid fa-mobile-screen-button"></i> <i class="fa-solid fa-rotate"></i>
+                    </span>
+                    <span class="header_notification" id="timestamp_last_run">00:00:00</span>
+                </div>
+                <div class="content">
+                    <canvas id="energyChart"></canvas>
+                </div>
+            </div>
+            <div class="right-box">
+                <div class="header"><i class="fa-solid fa-calendar-days"></i><span id="load_schedule_header"> Schedule
+                        next 24 hours</span></div>
+                <div class="content">
+                    <div id="discharge_scheduler" class="table">
+                        <div class="table-header">
+                            <div class="table-row">
+                                <div class="table-cell">time</div>
+                                <div class="table-cell">Control<br><i style="font-size: smaller;"></i>target state</i>
+                                </div>
+                                <div class="table-cell">Price<br><i style="font-size: smaller;"
+                                        id="price_minor_unit_label">.../kWh</i></div>
+                                <div class="table-cell"
+                                    title="Shows your cost (Pay) and income (Earn) for this time slot. Format: Pay / Earn in your configured currency.">
+                                    Pay/ Earn<br><i style="font-size: smaller;" id="schedule_currency_symbol">...</i>
+                                </div>
+                                <div class="table-cell">SOC<br><i style="font-size: smaller;">%</i></div>
+                            </div>
+                        </div>
+                        <div class="table-row">
+                            &nbsp;
+                        </div>
+                        <div class="table-body">
+                            <div class="table-row">
+                                <div class="table-cell">Data 1</div>
+                                <div class="table-cell">Data 2</div>
+                                <div class="table-cell">Data 3</div>
+                                <div class="table-cell">Data 4</div>
+                                <div class="table-cell">Data 5</div>
+                            </div>
+                            <div class="table-row">
+                                <div class="table-cell">Data 5</div>
+                                <div class="table-cell">Data 6</div>
+                                <div class="table-cell">Data 7</div>
+                                <div class="table-cell">Data 8</div>
+                                <div class="table-cell">Data 9</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="experimental-banner" style="
+    position: fixed;
+    bottom: 16px;
+    left: 16px;
+    background: rgba(241, 177, 0, 0.5);
+    color: #222;
+    padding: 8px 18px 8px 12px;
+    border-radius: 6px;
+    font-size: 0.95em;
+    font-weight: bold;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+    z-index: 1001;
+    display: none;
+    align-items: center;
+    gap: 8px;
+">
+        <i class="fa-solid fa-flask" style="margin-right: 8px;"></i>
+        Experimental Mode: EVopt is in charge
+    </div>
+
+    <!-- Load JavaScript modules in correct order -->
+    <script src="js/constants.js?v={{ asset_version }}"></script>
+    <script src="js/ui.js?v={{ asset_version }}"></script>
+    <script src="js/data.js?v={{ asset_version }}"></script>
+    <script src="js/bugreport.js?v={{ asset_version }}"></script>
+    <script src="js/chart.js?v={{ asset_version }}"></script>
+    <script src="js/controls.js?v={{ asset_version }}"></script>
+    <script src="js/schedule.js?v={{ asset_version }}"></script>
+    <script src="js/statistics.js?v={{ asset_version }}"></script>
+    <script src="js/evcc.js?v={{ asset_version }}"></script>
+    <script src="js/battery.js?v={{ asset_version }}"></script>
+    <script src="js/logging.js?v={{ asset_version }}"></script>
+    <script src="js/config.js?v={{ asset_version }}"></script>
+    <script src="js/backup.js?v={{ asset_version }}"></script>
+    <script src="js/wizard.js?v={{ asset_version }}"></script>
+    <script src="js/update_banner.js?v={{ asset_version }}"></script>
+    <script src="js/main.js?v={{ asset_version }}"></script>
+
+</body>
+
+</html>

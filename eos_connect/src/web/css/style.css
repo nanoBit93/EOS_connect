@@ -1,0 +1,1218 @@
+/* Make chart fill card in normal mode */
+
+@media (min-width: 769px) {
+    #energyChart {
+        width: 100% !important;
+        height: 90% !important;
+        display: block;
+    }
+    .content {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    }  
+}
+
+body {
+    margin: 0;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    background-color: rgb(54, 54, 54);
+    color: lightgray;
+}
+
+.container {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+}
+
+.top-boxes,
+.bottom-boxes {
+    display: flex;
+}
+
+/* Battery Overview Styles */
+.battery-stat-card {
+    background-color: rgba(0, 0, 0, 0.3);
+    border-radius: 8px;
+    padding: 15px;
+    text-align: center;
+    border-left: 4px solid #888;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    min-height: 80px;
+}
+
+.battery-stat-card .label {
+    font-size: 0.8em;
+    color: #aaa;
+    margin-bottom: 5px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+.battery-stat-card .value {
+    font-size: 1.4em;
+    font-weight: bold;
+    color: #fff;
+}
+
+.battery-stat-card .sub-label {
+    font-size: 0.7em;
+    color: #666;
+    margin-top: 5px;
+}
+
+@media (max-width: 768px) {
+    .battery-stats-container {
+        gap: 5px !important;
+    }
+    .battery-stat-card {
+        padding: 8px;
+        min-height: 40px;
+    }
+    .battery-stat-card .value {
+        font-size: 1.1em;
+    }
+    .battery-stat-card .label {
+        font-size: 0.7em;
+        margin-bottom: 2px;
+    }
+    .battery-stat-card .sub-label {
+        display: block;
+        font-size: 0.65em;
+        line-height: 1.2;
+    }
+    /* Compact sections on mobile */
+    .battery-overview-section {
+        padding: 10px !important;
+        gap: 10px !important;
+    }
+    .battery-overview-card {
+        padding: 10px !important;
+    }
+    .battery-overview-card table {
+        font-size: 0.75em !important;
+    }
+    .battery-overview-card td, .battery-overview-card th {
+        padding: 4px 2px !important;
+    }
+
+    /* Toast notifications - centered on mobile */
+    #toast-container {
+        top: 20px !important;
+        right: auto !important;
+        left: 5% !important;
+        transform: translateX(0%);
+        max-width: calc(100% - 40px);
+    }
+}
+
+/* Very small screens (e.g. iPhone SE) */
+@media (max-width: 400px) {
+    .battery-sessions-list {
+        display: none !important;
+    }
+    .battery-overview-card {
+        flex: 1 1 0 !important; /* Let the chart take all space */
+    }
+}
+
+.top-boxes {
+    height: 20%;
+}
+
+.top-box {
+    flex: 1;
+    /* Long labels inside a tile wrap rather than push the row wider, so one tile with
+       a lot to say cannot squeeze its neighbours. */
+    min-width: 0;
+    margin: 10px;
+    padding: 10px;
+    background-color: rgb(78, 78, 78);
+    box-shadow: 0 0 10px rgba(0, 0, 0, 0.5);
+    border-radius: 10px;
+    display: flex;
+    flex-direction: column;
+    /*
+     * A size container, so the text below can be sized from *this tile's* width rather
+     * than the viewport's.
+     *
+     * Viewport width was the wrong dimension twice over. It cannot see how many tiles
+     * share the row -- a fifth tile takes every share down by a fifth, which had to be
+     * compensated for by hand -- and it cannot see the phone layout, where one stacked
+     * tile is the full width of the screen. The tile's own inline size answers both
+     * without being told.
+     */
+    container-type: inline-size;
+}
+
+/*
+ * Fallback for browsers without container queries (pre-2023). Sized by viewport width,
+ * which is what the whole row used before: smaller than it needs to be on a wide screen,
+ * but never wrapped. The rules below override it wherever cqi is understood.
+ */
+.top-box>.header,
+.top-box>.content {
+    font-size: clamp(10px, min(1.5vh, 0.8vw), 18px);
+}
+
+/*
+ * How large the text can be is a property of the tile, not of the screen: text may grow
+ * until the widest row is about to wrap. Measured across 20 viewports from 320px to
+ * 3440px wide, that point is `0.0567 * W - 2.25px` for a tile of inline size W -- the
+ * same line through every one of them, to within a tenth of a pixel. It is affine and
+ * not a plain percentage because the padding, borders and cell gaps a row spends its
+ * width on do not shrink with the tile. The rule below sits about 7% under that line,
+ * which is the margin for a font wider than the one measured with.
+ *
+ * The row it is measured from is "Needed Energy" against "12.4 kWh / 3.21 EUR" -- two
+ * values in one cell, and the widest pairing on the row. Behind it was a 30-character
+ * "Dynamic Max AC+DC Charge Power", since shortened, which held the whole row 25% below
+ * this line for the sake of one label.
+ *
+ * Headers get a slightly larger share of the width: a header spends it on a title and
+ * two chips rather than on two columns of a table, and does not wrap until about 6.3%.
+ * They share the *height* rule below unchanged, though, so the bump only happens where
+ * there is height to spare -- on a short screen the row's height is the scarce side, and
+ * a larger header there would be taken straight out of the table under it.
+ */
+.top-box>.header {
+    font-size: clamp(10px, 6cqi - 2.4px, 30px);
+}
+
+.top-box>.content {
+    font-size: clamp(9px, 5.4cqi - 2.4px, 28px);
+}
+
+/*
+ * The two quieter tiers, relative to the tile's own text rather than to the viewport, so
+ * the hierarchy holds at every size: row headings a little smaller, row labels smaller
+ * again.
+ */
+.top-box .top_box_info_text_head {
+    font-size: 0.86em;
+}
+
+.top-box .top_box_info_text {
+    font-size: 0.74em;
+}
+
+/*
+ * Vertical spacing inside a tile is proportional to the tile's own text; only the frame
+ * (the tile's margin and padding) stays fixed.
+ *
+ * It used to be fixed throughout -- 10px for the header's padding, 10px for the
+ * content's, 10px on top of the table -- and on a 16:9 screen that overhead was most of
+ * the tile. At 1600x900 a tile is 160px tall and 90px of it was padding, so the text had
+ * to fit 60px however much width it had, and the height rule below held the row to 11px
+ * where the width allowed 17px. Proportional spacing spends the tile's height on text
+ * and its padding in the same ratio at every screen size.
+ *
+ * Horizontal padding stays at 10px: that side is not short of room, and the header's
+ * chips are positioned against it.
+ */
+.top-box>.header {
+    padding: 0.5em 10px;
+}
+
+.top-box>.content {
+    padding: 0.5em 10px;
+}
+
+.top-box .content table {
+    padding-top: 0.4em;
+}
+
+/*
+ * The chips ride the middle of the header rather than sitting 10px from its top.
+ *
+ * 10px was safe while the header's padding was a fixed 10px too, so the header could
+ * never be shorter than a chip. With proportional padding it can: at 1280x720 the header
+ * is 21px tall and a 16px chip pinned 10px down hung 5px out the bottom of it.
+ */
+.top-box>.header .header_notification {
+    top: 50%;
+    transform: translateY(-50%);
+}
+
+/*
+ * Side by side, the row is a fixed 20% of the viewport height, so the text has to fit
+ * that as well: at 1280x720 a tile has room for about 10px of text however wide it is,
+ * and the width rule above would spend 13px. Measured the same way as the width, a tile
+ * stops fitting its own height at `0.0177 * H - 2.1px`, and the rule sits just under it.
+ *
+ * Affine again, but only just: with the spacing inside a tile proportional (see above),
+ * the only part of its height that does not scale with the text is the 20px of margin
+ * around it. Before that it was 90px, and this term read `0.0254 * H - 11.3px` -- a
+ * third of the row's height on a 16:9 screen, which is what used to hold the text there
+ * so far below what its width allowed.
+ *
+ * Below the phone breakpoint the tiles stack and the row grows to fit its content, so
+ * there is no height to fit and this does not apply.
+ */
+@media (min-width: 769px) {
+    .top-box>.header {
+        font-size: clamp(10px, min(6cqi - 2.4px, 1.75vh - 2.4px), 30px);
+    }
+
+    .top-box>.content {
+        font-size: clamp(9px, min(5.4cqi - 2.4px, 1.75vh - 2.4px), 28px);
+    }
+}
+
+/*
+ * Managed loads is a summary tile, not a full one -- a name and a state per load, with
+ * the detail behind the overlay -- but it sits in a row of four full tiles, and a
+ * narrower fifth one read as unfinished next to them. So it has no width rule of its
+ * own: it takes the same flex:1 share as every other .top-box, and nothing has to be
+ * compensated for it. The row's text is sized from each tile's own width (see .top-box
+ * above), so a fifth share makes every tile's text a fifth smaller and leaves no label
+ * any closer to wrapping than it was with four.
+ *
+ * What it does need is a header of its own, below.
+ *
+ * The chip is flush with the right edge of the header, the same 10px in as every other
+ * tile's, and the title is centred on the tile -- but here the two are laid out in a
+ * three-column grid rather than one absolutely over the other.
+ *
+ * "Managed Loads" plus an energy value is the longest title-and-chip pairing on the row,
+ * so with the chip positioned absolutely the title reached under it at the narrower
+ * widths, and padding wide enough to clear it wrapped the title instead. The grid gives
+ * the icon and the chip a column each and centres the title between them: the outer
+ * columns are equal shares, so the title sits on the tile's centre line and the two can
+ * never meet at any width. The title still clips with an ellipsis rather than wrapping.
+ */
+#managed_loads_box>.header {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+}
+
+#managed_loads_box>.header>i {
+    justify-self: end;
+    margin-right: 0.4em;
+}
+
+#managed_loads_box>.header .header-title {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+#managed_loads_box>.header .header_notification {
+    position: static;
+    justify-self: end;
+    white-space: nowrap;
+    /* A grid item, so it is already centred by align-items and the nudge that centres
+       the absolutely positioned chips would lift it half its height out of the row. */
+    transform: none;
+}
+
+/* One row per load: the name takes what is left after the state, and is clipped rather
+   than wrapped. A wrapped name doubles the tile's height for no information. */
+.managed-load-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 0;
+    width: 60%;
+}
+
+.managed-load-state {
+    text-align: right;
+    white-space: nowrap;
+}
+
+.managed-load-more {
+    opacity: 0.7;
+    font-style: italic;
+}
+
+.bottom-boxes {
+    height: 80%;
+}
+
+.left-box {
+    width: 75%;
+    margin: 10px;
+    padding: 10px;
+    border-radius: 10px;
+    background-color: rgb(78, 78, 78);
+}
+
+.right-box {
+    width: 24%;
+    margin: 10px;
+    padding: 10px;
+    border-radius: 10px;
+    background-color: rgb(78, 78, 78);
+    display: flex;
+    flex-direction: column;
+}
+
+.header {
+    background-color: rgb(114, 114, 114);
+    ;
+    color: white;
+    padding: 10px;
+    text-align: center;
+    border-radius: 10px;
+    position: relative;
+}
+
+.header_notification {
+    background-color: rgb(58, 58, 58);
+    color: white;
+    padding: 4px;
+    text-align: center;
+    border-radius: 5px;
+    font-size: 0.65em;
+    position: absolute;
+    top: 10px;
+    right: 10px;
+}
+
+.content {
+    padding: 10px;
+    flex: 1;
+    overflow: auto;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+th,
+td {
+    padding: 0 5px 0 5px;
+    text-align: left;
+}
+
+th {
+    text-align: center;
+}
+
+#overlay_menu {
+    position: fixed;
+    top: 10%;
+    left: 20%;
+    width: 60%;
+    /* height: 80%; */
+    background-color: rgba(0, 0, 0, 0.9);
+    color: white;
+    justify-content: center;
+    align-items: center;
+    z-index: 2000;
+    border-radius: 10px;
+    box-shadow: 0 0 10px rgba(0, 0, 0, 0.5);
+    overflow: auto;
+}
+
+#overlay_menu_content_wrapper {
+    width: 100%;
+    /* height: 100%; */
+    border-radius: 10px;
+    border: solid 1px rgba(255, 255, 255, 0.5);
+    margin: 10px;
+}
+
+#overlay_menu_content {
+    padding-bottom: 5%;
+}
+
+#mobileview_rotate {
+    display: none;
+}
+
+.valueChange {
+    transition: color 2s ease-out;
+}
+
+/* Media Queries for Smartphones */
+@media (max-width: 768px) {
+    .top-boxes {
+        flex-direction: column;
+        height: auto;
+    }
+
+    /* Stacked, so the tile is as tall as its content. */
+    .top-box {
+        height: auto;
+    }
+
+    /*
+     * Stacked, a tile also sits directly above Optimization and Schedule, so it takes
+     * its sizes from those rather than from its own width.
+     *
+     * Sizing text from the tile's width is for the side-by-side row, where five tiles
+     * share it and each one has a different amount of room. Here every box is the full
+     * width of the screen, so the width says nothing, and reading it anyway made the
+     * tiles a size of their own -- an 18.6px heading over three tiers of body text,
+     * above a 16px heading and one 14.3px tier in every box below them.
+     */
+    .top-box>.header {
+        /* What .left-box and .right-box headers inherit from the body. */
+        font-size: 1em;
+    }
+
+    .top-box>.content {
+        /* What the Schedule table works out to: 0.35em of .right-box's 1.2em content,
+           plus the same 0.9vh term, so the two track each other on any phone. */
+        font-size: calc(0.42em + 0.9vh);
+    }
+
+    /*
+     * ...but never more than the tile can carry. With one size inside a tile instead of
+     * three, the widest row -- "Needed Energy" against "12.4 kWh / 3.21 EUR" -- is 35%
+     * wider than it was, because the label is no longer the quiet tier. Measured the
+     * same way as the side-by-side row, a stacked tile fits `0.0487 * W - 1.93px`, which
+     * the size above exceeds by a fraction of a pixel on a 360px phone and by one pixel
+     * on a 320px one.
+     *
+     * So the Schedule's size on any phone 390px and wider, which is all of the common
+     * ones, and up to 0.8px under it on the two narrowest -- below the eye's notice,
+     * where the alternative is a label on two lines.
+     */
+    .top-box>.content {
+        font-size: min(0.42em + 0.9vh, 4.7cqi - 1.9px);
+    }
+
+    /*
+     * One size inside a tile. The quieter tiers exist to fit a label into a tile that is
+     * a fifth of a row; a tile with the whole screen to itself does not need them, and
+     * three sizes in a stacked column read as three different kinds of box.
+     */
+    .top-box .top_box_info_text_head,
+    .top-box .top_box_info_text {
+        font-size: 1em;
+    }
+
+    /* .left-box > .header {
+        font-size: 1.3em;
+    } */
+
+    .bottom-boxes {
+        flex-direction: column;
+        height: auto;
+    }
+
+    .left-box,
+    .right-box {
+        width: auto;
+        height: auto;
+    }
+
+    /* .right-box {
+        font-size: smaller;
+    } */
+
+    .right-box>.content {
+        font-size: 1.2em;
+    }
+
+    #overlay_menu {
+        top: 10%;
+        left: 7.5%;
+        width: 85%;
+        height: auto;
+    }
+
+    #mobileview_rotate {
+        display: block;
+    }
+}
+
+@media (max-height: 600px) and (min-aspect-ratio: 1/1) {
+    .top-boxes {
+        display: none;
+    }
+
+    .bottom-boxes {
+        height: 100%;
+    }
+
+    .left-box {
+        width: 100%;
+    }
+
+    .content {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        height: 85%;
+    }
+
+    .right-box {
+        display: none;
+    }
+
+    #mobileview_rotate {
+        display: none;
+    }
+}
+
+
+.table {
+    display: table;
+    width: 100%;
+    border-collapse: collapse;
+    font-size: calc(0.35em + 0.9vh);
+}
+
+.table-header,
+.table-body {
+    display: table-row-group;
+}
+
+.table-row {
+    display: table-row;
+}
+
+.table-header .table-cell {
+    font-style: italic;
+    text-align: center;
+    padding-bottom: 0.5em;
+}
+
+.table-body .table-cell:first-child {
+    font-family: 'Seven Segment', sans-serif;
+    /* padding-right: 1em; */
+}
+
+.table-cell {
+    display: table-cell;
+    padding: 1px 5px;
+    text-align: left;
+    margin: 2px;
+    /* border-radius: 20px; */
+}
+
+.table-cell.rounded {
+    border-radius: 10px;
+    overflow: hidden;
+}
+
+/* Hide the up/down arrows for number inputs on desktop */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+
+/* For Firefox */
+input[type="number"] {
+    -moz-appearance: textfield;
+}
+
+/* ===================================
+   Update Banner Styles
+   =================================== */
+
+.update-banner {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    background: linear-gradient(135deg, #4a9eff 0%, #357abd 100%);
+    color: white;
+    padding: 15px 20px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    z-index: 999;
+    transform: translateY(-100%);
+    opacity: 0;
+    transition: transform 0.3s ease-out, opacity 0.3s ease-out;
+    border-bottom: 3px solid #2563a8;
+}
+
+.update-banner.update-banner-visible {
+    transform: translateY(0);
+    opacity: 1;
+}
+
+.update-banner-content {
+    max-width: 1200px;
+    margin: 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    flex-wrap: wrap;
+}
+
+.update-banner-icon {
+    font-size: 2em;
+    color: white;
+    animation: pulse-update 2s infinite;
+}
+
+@keyframes pulse-update {
+    0%, 100% {
+        opacity: 1;
+        transform: scale(1);
+    }
+    50% {
+        opacity: 0.7;
+        transform: scale(1.1);
+    }
+}
+
+/* Toast notification animations */
+@keyframes slideIn {
+    from {
+        transform: translateX(400px);
+        opacity: 0.8;
+    }
+    to {
+        transform: translateX(0);
+        opacity: 1;
+    }
+}
+
+@keyframes slideOut {
+    from {
+        transform: translateX(0);
+        opacity: 1;
+    }
+    to {
+        transform: translateX(400px);
+        opacity: 0;
+    }
+}
+
+/* Active mode indicator pulse animation */
+@keyframes pulseCheckmark {
+    0%, 100% {
+        transform: scale(1);
+        opacity: 1;
+    }
+    50% {
+        transform: scale(1.2);
+        opacity: 0.8;
+    }
+}
+
+/* Loading spinner animation */
+@keyframes spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+#loading-modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: rgba(0, 0, 0, 0.7);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 10001;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.3s ease-out;
+}
+
+#loading-modal.show {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.loading-modal-content {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 20px;
+}
+
+.spinner {
+    width: 60px;
+    height: 60px;
+    border: 4px solid rgba(255, 255, 255, 0.2);
+    border-top-color: #4a9eff;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+
+.loading-text {
+    color: white;
+    font-size: 1.2em;
+    font-weight: 500;
+    letter-spacing: 0.5px;
+}
+
+.update-banner-text {
+    flex: 1;
+    min-width: 200px;
+}
+
+.update-banner-text strong {
+    display: block;
+    font-size: 1.1em;
+    margin-bottom: 4px;
+}
+
+.update-banner-text span {
+    font-size: 0.9em;
+    opacity: 0.95;
+}
+
+.update-banner-actions {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+}
+
+.update-banner-button {
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-size: 0.9em;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    border: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    text-decoration: none;
+    font-weight: 500;
+}
+
+.update-banner-button:not(.update-banner-dismiss) {
+    background-color: white;
+    color: #4a9eff;
+}
+
+.update-banner-button:not(.update-banner-dismiss):hover {
+    background-color: #f0f0f0;
+    transform: translateY(-2px);
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+}
+
+.update-banner-button.update-banner-dismiss {
+    background-color: rgba(255, 255, 255, 0.2);
+    color: white;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+}
+
+.update-banner-button.update-banner-dismiss:hover {
+    background-color: rgba(255, 255, 255, 0.3);
+    border-color: rgba(255, 255, 255, 0.5);
+}
+
+/* Mobile responsive */
+@media (max-width: 768px) {
+    .update-banner {
+        padding: 12px 15px;
+    }
+    
+    .update-banner-content {
+        gap: 12px;
+    }
+    
+    .update-banner-icon {
+        font-size: 1.5em;
+    }
+    
+    .update-banner-text {
+        flex: 1 1 100%;
+    }
+    
+    .update-banner-text strong {
+        font-size: 1em;
+    }
+    
+    .update-banner-text span {
+        font-size: 0.85em;
+    }
+    
+    .update-banner-actions {
+        flex: 1 1 100%;
+        justify-content: stretch;
+    }
+    
+    .update-banner-button {
+        flex: 1;
+        justify-content: center;
+        padding: 10px 12px;
+        font-size: 0.85em;
+    }
+}
+
+/* ===================================
+   Version Comparison Responsive Styles
+   =================================== */
+
+/* Desktop and landscape: horizontal layout */
+.version-comparison-container {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 20px;
+    justify-content: center;
+}
+
+.version-box {
+    font-size: 1.2em;
+    color: #fff;
+    font-weight: bold;
+    background-color: rgba(255,255,255,0.1);
+    padding: 10px 16px;
+    border-radius: 6px;
+    text-align: center;
+    width: 180px;
+    flex-shrink: 0;
+}
+
+.version-box-latest {
+    color: #4a9eff;
+    background-color: rgba(74, 158, 255, 0.2);
+    border: 1px solid #4a9eff;
+}
+
+.version-arrow {
+    font-size: 1.5em;
+    color: #4a9eff;
+    width: 40px;
+    text-align: center;
+    flex-shrink: 0;
+}
+
+.version-arrow-horizontal {
+    display: inline-block;
+}
+
+.version-arrow-vertical {
+    display: none;
+}
+
+.version-labels-container {
+    display: flex;
+    gap: 20px;
+    justify-content: center;
+}
+
+.version-label {
+    text-align: center;
+    width: 180px;
+    font-size: 0.8em;
+    color: #888;
+}
+
+.version-label-spacer {
+    width: 40px;
+}
+
+/* Mobile portrait: vertical layout */
+@media (max-width: 768px) and (orientation: portrait) {
+    .version-comparison-container {
+        flex-direction: column;
+        gap: 12px;
+    }
+
+    .version-box {
+        width: 100%;
+        max-width: 250px;
+        font-size: 1.1em;
+        padding: 8px 14px;
+    }
+
+    .version-arrow {
+        width: auto;
+        font-size: 1.3em;
+        transform: rotate(90deg);
+        margin: -5px 0;
+    }
+
+    .version-arrow-horizontal {
+        display: none;
+    }
+
+    .version-arrow-vertical {
+        display: inline-block;
+    }
+
+    .version-labels-container {
+        flex-direction: column;
+        gap: 12px;
+        width: 100%;
+    }
+
+    .version-label {
+        width: 100%;
+        max-width: 250px;
+    }
+
+    .version-label-spacer {
+        display: none;
+    }
+}
+/* ===================================
+   Full-screen overlay shell
+
+   These used to be inline styles built from isMobile() in showFullScreenOverlay().
+   That helper is sampled once, when the overlay is rendered, so an overlay opened in
+   portrait kept its phone paddings and font size after the device was rotated. A media
+   query re-evaluates on rotation; the JS did not.
+   =================================== */
+
+#full_screen_overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background-color: rgba(0, 0, 0, 0.6);
+    z-index: 1000;
+    padding: 60px;
+    box-sizing: border-box;
+}
+
+.fs-overlay-card {
+    background-color: rgb(78, 78, 78);
+    border-radius: 10px;
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 0 20px rgba(0, 0, 0, 0.5);
+}
+
+#full_screen_header {
+    padding: 15px 20px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 10px 10px 0 0;
+    background-color: rgb(58, 58, 58);
+    color: lightgray;
+    font-weight: bold;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 1em;
+}
+
+#full_screen_content {
+    flex: 1;
+    padding: 20px;
+    overflow: auto;
+    color: lightgray;
+    font-size: 1em;
+}
+
+.fs-overlay-close {
+    background: none;
+    border: none;
+    color: lightgray;
+    font-size: 1.5em;
+    cursor: pointer;
+    padding: 0;
+    width: 30px;
+    height: 30px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    transition: background-color 0.2s;
+    flex-shrink: 0;
+}
+
+.fs-overlay-close:hover {
+    background-color: rgba(255, 255, 255, 0.1);
+}
+
+@media (max-width: 768px) {
+    #full_screen_overlay {
+        padding: 8px;
+    }
+
+    .fs-overlay-card {
+        border-radius: 6px;
+    }
+
+    #full_screen_header {
+        padding: 12px 15px;
+        border-radius: 6px 6px 0 0;
+        font-size: 1.1em;
+    }
+
+    #full_screen_content {
+        padding: 15px;
+        font-size: 0.85em;
+    }
+
+    .fs-overlay-close {
+        width: 28px;
+        height: 28px;
+    }
+}
+
+/* ===================================
+   PV Autoscaling overlay
+
+   Built as a template string in statistics.js, so only the layout properties live here —
+   colours and borders stay inline next to the data that picks them.
+   =================================== */
+
+.pv-scale-root {
+    height: 100%;
+    overflow: hidden;
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+    box-sizing: border-box;
+}
+
+.pv-scale-panel {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+}
+
+.pv-scale-section-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 15px;
+}
+
+/* 140px, not 120px: the widest tile holds a 1.8em monospace factor, which does not fit a
+   120px track once its padding is taken off. */
+.pv-scale-tiles {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px;
+}
+
+.pv-scale-tiles>div {
+    min-width: 0;
+}
+
+.pv-scale-total-value {
+    font-size: 1.8em;
+    font-weight: bold;
+    font-family: monospace;
+}
+
+/* On its own line rather than trailing the factor: "0.561× (-43.9%)" at 1.8em is wider
+   than any tile the auto-fit grid produces, at every viewport. */
+.pv-scale-total-pct {
+    display: block;
+    font-size: 0.5em;
+    font-weight: 600;
+}
+
+.pv-scale-forecast-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+}
+
+.pv-scale-forecast-grid>div {
+    min-width: 0;
+}
+
+/* Label on the left, value on the right — with a gap, so a value that grows past its half
+   of the row wraps under the label instead of butting against it. */
+.pv-scale-kv {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 4px 10px;
+    min-width: 0;
+}
+
+.pv-scale-tf-grid {
+    display: grid;
+    gap: 6px;
+    font-size: 0.8em;
+}
+
+.pv-scale-tf-grid>div {
+    min-width: 0;
+}
+
+.pv-scale-history {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+/* Narrow: the fixed column counts have to collapse. Four timeframe cells across a phone
+   leave ~47px each, which wraps "R: 5.15 kWh" onto four lines. */
+@media (max-width: 768px) {
+    .pv-scale-tiles {
+        grid-template-columns: repeat(2, 1fr);
+    }
+
+    .pv-scale-tile-total {
+        grid-column: 1 / -1;
+    }
+
+    .pv-scale-total-value {
+        font-size: 1.35em;
+    }
+
+    /* Relative to a value that just shrank by a quarter, 0.5em is unreadable. */
+    .pv-scale-total-pct {
+        font-size: 0.65em;
+    }
+
+    .pv-scale-forecast-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .pv-scale-tf-grid {
+        grid-template-columns: repeat(2, 1fr) !important;
+    }
+
+    .pv-scale-section-head {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 2px;
+    }
+}
+
+/* Narrow OR short — a phone in landscape is 874x402, which the width query above misses.
+   One scroll context: the overlay's own #full_screen_content. Nesting a 300px day list
+   inside a flex:1 scroller inside that gives a touch three places to land, and the outer
+   two clip whatever the banner pushes past 100%. */
+@media (max-width: 768px), (max-height: 700px) {
+    .pv-scale-root {
+        height: auto;
+        overflow: visible;
+        padding: 0;
+    }
+
+    .pv-scale-panel {
+        flex: 0 0 auto;
+        overflow-y: visible;
+        padding: 10px !important;
+    }
+
+    .pv-scale-history {
+        max-height: none;
+        overflow-y: visible;
+    }
+
+    .pv-scale-kv {
+        flex-wrap: wrap;
+    }
+
+    .pv-scale-root code {
+        word-break: break-word;
+        overflow-wrap: anywhere;
+    }
+}

@@ -1,0 +1,749 @@
+"""
+Interface Factory - Centralized creation and initialization of interfaces with integrated
+startup validation.
+
+This factory pattern centralizes interface instantiation and error handling,
+reducing code duplication in the main application and providing a consistent
+approach to startup error collection.
+"""
+
+import logging
+from typing import Optional, Dict, Any
+from datetime import tzinfo
+
+try:  # running from src/ — src/ is on sys.path
+    from boot_state import BOOT
+except ImportError:  # imported as src.interface_factory (tests)
+    from .boot_state import BOOT
+
+# eos_connect.py attaches its handlers to the "__main__" logger, not to root, so
+# a logging.getLogger(__name__) here propagates to a handler-less root and every
+# message is silently discarded — including the ones this module exists to
+# surface in /logs/alerts and the startup-errors panel.
+logger = logging.getLogger("__main__")
+
+#: Which boot step each component belongs to.  Kept here rather than at the call
+#: sites: the factory already knows the component name and whether creation
+#: worked, so threading the step through two dozen module-level statements in
+#: eos_connect.py would only be a second place to forget one.
+_BOOT_STEPS = {
+    "optimization_interface": "eos",
+    "inverter_interface": "inverter",
+    "managed_load_manager": "managed_loads",
+    "load_interface": "load",
+    "battery_interface": "battery",
+    "mqtt_interface": "mqtt",
+    "evcc_interface": "evcc",
+    "price_interface": "price",
+    "feed_in_price_interface": "feed_in_price",
+    "pv_interface": "pv",
+    "pv_autoscaler": "pv_autoscale",
+}
+
+
+class InterfaceFactory:
+    """
+    Factory for creating and initializing interfaces with integrated startup validation.
+    
+    Handles:
+    - Interface instantiation
+    - Error catching and registration with startup validator
+    - Fallback creation for non-critical failures
+    - Categorization of critical vs non-critical errors
+    """
+
+    def __init__(self, startup_validator):
+        """
+        Initialize the factory with a startup validator.
+        
+        Args:
+            startup_validator: StartupValidator instance to register errors with
+        """
+        self.validator = startup_validator
+        self.created_interfaces = {}
+
+    def create_load_interface(
+        self,
+        config: Dict[str, Any],
+        time_frame_base: int,
+        time_zone: tzinfo,
+        request_timeout: int = 10,
+        critical: bool = True,
+        extra_subtract_sensors=None,
+    ):
+        """
+        Create LoadInterface with error handling.
+        
+        Args:
+            config: Load configuration dictionary
+            time_frame_base: Base time frame in seconds
+            time_zone: Timezone for timestamps
+            request_timeout: Request timeout in seconds
+            critical: Whether interface is critical (stops startup on failure)
+            extra_subtract_sensors: Power sensors of managed loads, removed from the
+                household base load so their predicted consumption is not counted twice
+            
+        Returns:
+            LoadInterface instance or None if non-critical and failed
+            
+        Raises:
+            Exception if critical interface fails
+        """
+        return self._create_interface(
+            component_name="load_interface",
+            category="connectivity",
+            critical=critical,
+            title="Load interface unavailable",
+            error_message="Failed to retrieve load data from HomeAssistant",
+            config_link="#load",
+            creator_func=lambda: self._import_and_create(
+                "interfaces.load_interface",
+                "LoadInterface",
+                config,
+                time_frame_base,
+                time_zone,
+                request_timeout=request_timeout,
+                extra_subtract_sensors=extra_subtract_sensors,
+            ),
+        )
+
+    def create_managed_load_manager(
+        self,
+        entries,
+        time_frame_base: int,
+        time_zone: tzinfo,
+        sources=None,
+        store=None,
+        cycle_seconds: int = 300,
+        max_power_w: int = 0,
+        on_release_change=None,
+    ):
+        """
+        Create the managed load manager with error handling.
+
+        Never critical: a mistyped pool configuration must not stop the house being
+        optimized. On failure the caller substitutes a manager with no entries, which
+        is a no-op on the optimizer path.
+
+        Returns:
+            ManagedLoadManager instance, or None if creation failed
+        """
+        return self._create_interface(
+            component_name="managed_load_manager",
+            category="configuration",
+            critical=False,
+            title="Managed loads unavailable",
+            error_message="Failed to set up the configured managed loads",
+            config_link="#managed-loads",
+            creator_func=lambda: self._import_and_create(
+                "loads.manager",
+                "ManagedLoadManager",
+                entries,
+                time_frame_base,
+                time_zone,
+                sources=sources,
+                store=store,
+                cycle_seconds=cycle_seconds,
+                max_power_w=max_power_w,
+                on_release_change=on_release_change,
+            ),
+        )
+
+    def create_battery_interface(
+        self,
+        config: Dict[str, Any],
+        load_interface,
+        time_zone: tzinfo,
+        base_control,
+        request_timeout: int = 10,
+        critical: bool = True,
+    ):
+        """
+        Create BatteryInterface with error handling.
+        
+        Args:
+            config: Battery configuration dictionary
+            load_interface: LoadInterface instance (dependency)
+            time_zone: Timezone for timestamps
+            base_control: BaseControl instance (dependency)
+            request_timeout: Request timeout in seconds
+            critical: Whether interface is critical
+            
+        Returns:
+            BatteryInterface instance or None if non-critical and failed
+            
+        Raises:
+            Exception if critical interface fails
+        """
+        return self._create_interface(
+            component_name="battery_interface",
+            category="connectivity",
+            critical=critical,
+            title="Battery sensor unreachable",
+            error_message="Failed to retrieve battery data from HomeAssistant",
+            config_link="#battery",
+            creator_func=lambda: self._import_and_create(
+                "interfaces.battery_interface",
+                "BatteryInterface",
+                config,
+                on_bat_max_changed=None,
+                load_interface=load_interface,
+                timezone=time_zone,
+                base_control=base_control,
+                request_timeout=request_timeout,
+            ),
+        )
+
+    def create_price_interface(
+        self,
+        config: Dict[str, Any],
+        time_frame_base: int,
+        time_zone: tzinfo,
+        evcc_interface=None,
+        critical: bool = False,
+    ):
+        """
+        Create PriceInterface with error handling.
+        
+        Args:
+            config: Price configuration dictionary
+            time_frame_base: Base time frame in seconds
+            time_zone: Timezone for timestamps
+            evcc_interface: Optional EvccInterface instance for EVCC price source
+            critical: Whether interface is critical (non-critical by default)
+            
+        Returns:
+            PriceInterface instance or None if non-critical and failed
+            
+        Raises:
+            Exception if critical interface fails
+        """
+        return self._create_interface(
+            component_name="price_interface",
+            category="connectivity",
+            critical=critical,
+            title="Price source unreachable",
+            error_message="Failed to retrieve price data",
+            additional_message=" Fallback prices will be used.",
+            config_link="#price",
+            creator_func=lambda: self._import_and_create(
+                "interfaces.price_interface",
+                "PriceInterface",
+                config,
+                time_frame_base,
+                time_zone,
+                evcc_interface=evcc_interface,
+            ),
+        )
+
+    def create_feed_in_price_interface(
+        self,
+        config: Dict[str, Any],
+        time_frame_base: int,
+        time_zone: tzinfo,
+        evcc_interface=None,
+        critical: bool = False,
+    ):
+        """
+        Create FeedInPriceInterface with error handling.
+        
+        Args:
+            config: Feed-in price configuration dictionary
+            time_frame_base: Base time frame in seconds
+            time_zone: Timezone for timestamps
+            evcc_interface: Optional EVCC interface instance for feed-in price retrieval
+            critical: Whether interface is critical (non-critical by default)
+            
+        Returns:
+            FeedInPriceInterface instance or None if non-critical and failed
+            
+        Raises:
+            Exception if critical interface fails
+        """
+        return self._create_interface(
+            component_name="feed_in_price_interface",
+            category="connectivity",
+            critical=critical,
+            title="Feed-in price source unreachable",
+            error_message="Failed to retrieve feed-in price data",
+            additional_message=" Fallback prices will be used.",
+            config_link="#price",
+            creator_func=lambda: self._import_and_create(
+                "interfaces.feed_in_price_interface",
+                "FeedInPriceInterface",
+                config,
+                time_frame_base,
+                time_zone,
+                evcc_interface=evcc_interface,
+            ),
+        )
+
+    def create_pv_interface(
+        self,
+        pv_forecast_source: Dict[str, Any],
+        pv_forecast: list,
+        time_frame_base: int,
+        evcc_config: Dict[str, Any],
+        data_source_config: Dict[str, Any],
+        temperature_forecast_enabled: bool,
+        time_zone_str: str,
+        critical: bool = False,
+        site_location=None,
+    ):
+        """
+        Create PvInterface with error handling.
+        
+        Args:
+            pv_forecast_source: PV forecast source configuration
+            pv_forecast: List of PV forecast configurations
+            time_frame_base: Base time frame in seconds
+            evcc_config: EVCC configuration
+            data_source_config: Data source configuration (for HA integration)
+            temperature_forecast_enabled: Whether to fetch an outside temperature
+                forecast (see ``interfaces.pv_interface.wants_temperature_forecast``)
+            time_zone_str: Timezone string
+            critical: Whether interface is critical (non-critical by default)
+            site_location: ``(lat, lon)`` for this installation, used for the
+                temperature forecast when no PV entry carries coordinates
+            
+        Returns:
+            PvInterface instance or None if non-critical and failed
+            
+        Raises:
+            Exception if critical interface fails
+        """
+        # Build config_special dict with both EVCC and data_source configs
+        config_special = {
+            "url": evcc_config.get("url", ""),  # EVCC URL (backward compatible)
+            "data_source": data_source_config,   # HA connection info
+        }
+
+        return self._create_interface(
+            component_name="pv_interface",
+            category="connectivity",
+            critical=critical,
+            title="PV forecast unavailable",
+            error_message="Failed to retrieve PV forecast data",
+            additional_message=" System continues without PV data.",
+            config_link="#pv_forecast_source",
+            creator_func=lambda: self._import_and_create(
+                "interfaces.pv_interface",
+                "PvInterface",
+                pv_forecast_source,
+                pv_forecast,
+                time_frame_base,
+                config_special,
+                temperature_forecast_enabled,
+                time_zone_str,
+                site_location=site_location,
+            ),
+        )
+
+    def create_pv_autoscaler(
+        self,
+        config: Dict[str, Any],
+        pv_yield_store,
+        timezone: str = "UTC",
+        request_timeout: int = 10,
+        ssl_ignore: bool = False,
+        critical: bool = False,
+    ):
+        """
+        Create PvAutoscaler with error handling.
+
+        Args:
+            config: pv_autoscaling config dict
+            pv_yield_store: PvYieldStore instance
+            timezone: timezone string
+            request_timeout: request timeout in seconds
+            ssl_ignore: whether to ignore SSL certificate errors
+            critical: whether autoscaler is critical
+
+        Returns:
+            PvAutoscaler instance or None if non-critical and failed
+        """
+        return self._create_interface(
+            component_name="pv_autoscaler",
+            category="connectivity",
+            critical=critical,
+            title="PV Autoscaler unavailable",
+            error_message="Failed to initialize PV autoscaler",
+            config_link="#pv_autoscaling",
+            creator_func=lambda: self._import_and_create(
+                "interfaces.pv_autoscaler",
+                "PvAutoscaler",
+                config,
+                pv_yield_store,
+                timezone=timezone,
+                request_timeout=request_timeout,
+                ssl_ignore=ssl_ignore,
+                auto_start=False,
+            ),
+        )
+
+    def create_mqtt_interface(
+        self,
+        config: Dict[str, Any],
+        critical: bool = False,
+    ):
+        """
+        Create MqttInterface with error handling.
+        
+        Args:
+            config: MQTT configuration dictionary
+            critical: Whether interface is critical (non-critical by default)
+            
+        Returns:
+            MqttInterface instance or None if non-critical and failed
+            
+        Raises:
+            Exception if critical interface fails
+        """
+        return self._create_interface(
+            component_name="mqtt_interface",
+            category="connectivity",
+            critical=critical,
+            title="MQTT broker unreachable",
+            error_message="Failed to connect to MQTT broker",
+            additional_message=" System continues but MQTT control is unavailable.",
+            config_link="#mqtt",
+            creator_func=lambda: self._import_and_create(
+                "interfaces.mqtt_interface",
+                "MqttInterface",
+                config_mqtt=config,
+                on_mqtt_command=None,
+            ),
+        )
+
+    def create_evcc_interface(
+        self,
+        evcc_url: str,
+        ext_bat_mode: bool,
+        critical: bool = False,
+    ):
+        """
+        Create EvccInterface with error handling.
+        
+        Args:
+            evcc_url: EVCC URL
+            ext_bat_mode: Extended battery mode flag
+            critical: Whether interface is critical (non-critical by default)
+            
+        Returns:
+            EvccInterface instance or None if non-critical and failed
+            
+        Raises:
+            Exception if critical interface fails
+        """
+        return self._create_interface(
+            component_name="evcc_interface",
+            category="connectivity",
+            critical=critical,
+            title="EVCC unreachable",
+            error_message="Failed to connect to EVCC",
+            additional_message=" System continues but EVCC data is unavailable.",
+            config_link="#evcc",
+            creator_func=lambda: self._import_and_create(
+                "interfaces.evcc_interface",
+                "EvccInterface",
+                url=evcc_url,
+                ext_bat_mode=ext_bat_mode,
+                update_interval=10,
+                on_charging_state_change=None,
+            ),
+        )
+
+    def create_inverter_interface(
+        self,
+        config: Dict[str, Any],
+        critical: bool = True,
+    ):
+        """
+        Create inverter interface using factory with error handling.
+        
+        Args:
+            config: Inverter configuration dictionary
+            critical: Whether interface is critical (stops startup on failure)
+            
+        Returns:
+            Inverter interface instance or None if non-critical and failed
+            
+        Raises:
+            Exception if critical interface fails
+        """
+        return self._create_interface(
+            component_name="inverter_interface",
+            category="initialization",
+            critical=critical,
+            title="Inverter type not supported or not configured",
+            error_message="Configured inverter type is not supported",
+            config_link="#inverter.type",
+            creator_func=lambda: self._import_and_create(
+                "interfaces.inverters",
+                "create_inverter",
+                config,
+            ),
+        )
+
+    def create_optimization_interface(
+        self,
+        config: Dict[str, Any],
+        time_frame_base: int,
+        timezone: tzinfo,
+        critical: bool = True,
+        inverter_max_grid_charge_rate_w: Optional[int] = None,
+        inverter_max_pv_charge_rate_w: Optional[int] = None,
+    ):
+        """
+        Create OptimizationInterface with error handling.
+        
+        Args:
+            config: Optimization configuration dictionary
+            time_frame_base: Base time frame in seconds
+            timezone: Timezone for timestamps
+            critical: Whether interface is critical (stops startup on failure)
+            
+        Returns:
+            OptimizationInterface instance or None if non-critical and failed
+            
+        Raises:
+            Exception if critical interface fails
+        """
+        return self._create_interface(
+            component_name="optimization_interface",
+            category="initialization",
+            critical=critical,
+            title="Optimizer backend failed to initialize",
+            error_message="Failed to load optimizer configuration",
+            config_link="#eos",
+            creator_func=lambda: self._import_and_create(
+                "interfaces.optimization_interface",
+                "OptimizationInterface",
+                config=config,
+                time_frame_base=time_frame_base,
+                timezone=timezone,
+                inverter_max_grid_charge_rate_w=inverter_max_grid_charge_rate_w,
+                inverter_max_pv_charge_rate_w=inverter_max_pv_charge_rate_w,
+            ),
+        )
+
+    def _create_interface(
+        self,
+        component_name: str,
+        category: str,
+        critical: bool,
+        title: str,
+        error_message: str,
+        config_link: str,
+        creator_func,
+        additional_message: str = "",
+    ):
+        """
+        Generic interface creation with error handling and validation.
+        
+        Args:
+            component_name: Name of the component for logging
+            category: Error category (initialization, configuration, connectivity)
+            critical: Whether failure should stop startup
+            title: User-friendly error title
+            error_message: Base error message
+            config_link: Link to configuration section
+            creator_func: Function that creates the interface
+            additional_message: Additional context for the error message
+            
+        Returns:
+            Interface instance, or None if creation failed.  **Never raises.**
+
+            A critical failure used to re-raise and end the process.  In the HA
+            add-on that meant s6 tearing the container down, which is how a
+            single bad setting made the configuration UI unreachable and left
+            the user no way to correct it (#349, #310, #83).  Now it records the
+            failure as fatal on the boot state and returns None; the caller
+            substitutes a stand-in, the web server stays up, and the user can
+            fix the setting and restart.  ``BOOT.fatal`` is what keeps that
+            honest — it stops the optimizer from running against a stand-in and
+            holds the error in front of the user.
+        """
+        step = _BOOT_STEPS.get(component_name)
+        if step:
+            BOOT.begin(step)
+
+        try:
+            interface = creator_func()
+
+            # For inverter interface, skip initialization here (deferred to background)
+            # This prevents app hang when inverter is unreachable at startup
+            if component_name == "inverter_interface" and interface is not None:
+                interface._deferred_init_required = True  # pylint: disable=protected-access
+
+            self.created_interfaces[component_name] = interface
+            logger.info("[Factory] Successfully created %s", component_name)
+            self._report_degraded_configuration(
+                interface, component_name, config_link
+            )
+            if step:
+                BOOT.finish(step)
+            return interface
+
+        except Exception as e:  # pylint: disable=broad-except
+            error_detail = str(e)
+            full_message = f"{error_message}: {error_detail}{additional_message}"
+
+            logger.exception(
+                "[Factory] Failed to create %s (critical=%s): %s",
+                component_name,
+                critical,
+                full_message,
+            )
+
+            # Register error with validator
+            self.validator.add_error(
+                category=category,
+                component=component_name,
+                severity="error",
+                title=title,
+                message=full_message,
+                action_required=critical,
+                config_link=config_link,
+            )
+
+            if step:
+                BOOT.fail(step, full_message)
+
+            if critical:
+                # Rescue mode: survive, but say so loudly. The caller's fallback
+                # keeps the module-level sequence running to the end so the web
+                # UI comes up complete; BOOT.fatal stops the optimizer and puts
+                # the error in front of the user.
+                BOOT.set_fatal(component_name, full_message)
+                logger.error(
+                    "[Factory] %s is required and could not be created — "
+                    "starting in rescue mode: the web interface stays up so the "
+                    "configuration can be corrected, but optimization is paused",
+                    component_name,
+                )
+                return None
+
+            logger.warning(
+                "[Factory] %s failed but is non-critical, continuing startup",
+                component_name,
+            )
+            return None
+
+    def initialize_inverter_deferred(self, inverter_interface, timeout_seconds: int = 30):
+        """
+        Initialize inverter interface in background with reduced timeout to prevent app hang.
+        
+        This is called after the web server starts, so if it takes time or fails, the UI is
+        still responsive and the user can fix configuration without restarting the container.
+        
+        Args:
+            inverter_interface: The inverter interface instance to initialize
+            timeout_seconds: Maximum time to wait for initialization (default 30 seconds)
+            
+        Returns:
+            True if initialization succeeded, False otherwise
+        """
+        if inverter_interface is None or not hasattr(inverter_interface, '_deferred_init_required'):
+            return True
+
+        if not inverter_interface._deferred_init_required:
+            return True
+
+        try:
+            logger.info(
+                "[Factory] Starting deferred inverter initialization (timeout=%ds)",
+                timeout_seconds,
+            )
+
+            # Set startup mode flag to reduce timeouts and retries
+            inverter_interface._startup_mode = True
+            inverter_interface._startup_timeout = timeout_seconds
+
+            # Try to initialize with reduced timeouts
+            inverter_interface.initialize()
+
+            # Clear flags on success
+            inverter_interface._deferred_init_required = False
+            inverter_interface._startup_mode = False
+
+            logger.info("[Factory] Inverter initialization completed successfully")
+            return True
+
+        except Exception as e:
+            logger.error(
+                "[Factory] Inverter initialization failed (will use NullInverter): %s",
+                str(e),
+            )
+
+            # Register error for startup panel
+            self.validator.add_error(
+                category="connectivity",
+                component="inverter_interface",
+                severity="error",
+                title="Inverter initialization failed",
+                message=f"Could not initialize inverter: {str(e)}",
+                action_required=True,
+                config_link="#inverter",
+            )
+
+            inverter_interface._deferred_init_required = False
+            inverter_interface._startup_mode = False
+            return False
+
+    def _report_degraded_configuration(self, interface, component_name, config_link):
+        """
+        Surface an interface that constructed successfully but cannot do its job.
+
+        The error path below only fires when a constructor *raises*. An interface that
+        is merely misconfigured does not raise — by design, so the user can fix it in
+        the web UI instead of the container crash-looping — and so it used to reach the
+        user as nothing at all. Anything that sets ``configuration_state`` to a
+        degraded value and says why gets an entry in /logs/alerts and the
+        startup-errors panel.
+
+        A message is required, not just a state, so an interface that tracks
+        ``configuration_state`` without explaining it keeps its existing behaviour.
+        """
+        if interface is None:
+            return
+
+        state = getattr(interface, "configuration_state", None)
+        detail = getattr(interface, "configuration_message", "")
+        if state not in ("incomplete", "invalid") or not detail:
+            return
+
+        # Not the caller's failure title: "Battery sensor unreachable" describes a
+        # connection that broke, and this is a setting that was never made.
+        self.validator.add_error(
+            category="configuration",
+            component=component_name,
+            severity="warning",
+            title="Incomplete configuration",
+            message=detail,
+            action_required=True,
+            config_link=config_link,
+        )
+
+    @staticmethod
+    def _import_and_create(module_name: str, class_name: str, *args, **kwargs):
+        """
+        Dynamically import a module and class, then instantiate it.
+        
+        Args:
+            module_name: Module path (e.g., 'interfaces.load_interface')
+            class_name: Class name to instantiate
+            *args: Positional arguments for class constructor
+            **kwargs: Keyword arguments for class constructor
+            
+        Returns:
+            Instance of the class
+            
+        Raises:
+            ImportError or any exception from class instantiation
+        """
+        import importlib
+
+        module = importlib.import_module(module_name)
+        cls = getattr(module, class_name)
+        return cls(*args, **kwargs)

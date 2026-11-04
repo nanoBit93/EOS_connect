@@ -1,0 +1,37 @@
+name: "EOS connect"
+description: "Advanced energy management system with built-in MILP optimizer, multi-source price integration, and real-time battery control. Configure via web UI with automatic Home Assistant integration."
+version: "0.3.4"
+slug: "eos_connect_nanobit"
+url: "https://github.com/nanoBit93/EOS_connect"
+arch:
+  - aarch64
+  - amd64
+
+panel_icon: mdi:home-battery
+panel_admin: false
+
+ingress: true
+ingress_port: 8081
+init: false
+
+image: "ghcr.io/nanobit93/ha-addon-eos-connect_{arch}"
+
+map:
+  - type: addon_config
+    read_only: false
+    path: /app/addon_config
+
+ports:
+  8081/tcp: 8081
+ports_description:
+  8081/tcp: "EOS Connect web server. To change external port: edit left number (e.g., '8082/tcp:8081'). Container uses 8081 internally."
+
+# Bootstrap configuration - only these options
+# All other settings are managed through the web UI and stored in the database
+options:
+  time_zone: "Europe/Berlin"
+  log_level: "info"
+
+schema:
+  time_zone: str
+  log_level: list(debug|info|warning|error)

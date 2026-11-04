@@ -1,0 +1,12 @@
+configuration:
+  time_zone:
+    name: Time Zone
+    description: >-
+      System time zone used for scheduling and timestamp display
+      (e.g., Europe/Berlin).
+
+  log_level:
+    name: Log Level
+    description: >-
+      Logging verbosity: debug, info, warning, error. All other settings are
+      configured in the EOS Connect web interface after start.
