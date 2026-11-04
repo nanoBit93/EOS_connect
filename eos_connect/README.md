@@ -1,11 +1,11 @@
 # EOS Connect add-on (nanoBit93)
 
 Home Assistant add-on packaging for the EOS Connect app source in this
-repository. The add-on is built from a pinned snapshot of `src/` kept in this
-repository at `eos_connect/src`.
+repository. `src/` at the repository root is the application source; the build
+workflow syncs it into the add-on folder before building.
 
 - App source: `/src` at this repository's root
-- Add-on source snapshot: `/eos_connect/src`
+- Add-on packaging: `/eos_connect` (source synced in at build time)
 - CI: `home-assistant/builder` builds both architectures and publishes to GHCR
   on pushes to `main` (see `.github/workflows/ha_addon_builder.yml`)
 

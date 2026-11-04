@@ -1,6 +1,6 @@
 # Home Assistant add-on image for EOS Connect, built from the app source in
-# this repository (``eos_connect/src`` mirrors ``src/`` at the repository root,
-# pinned to the same commit).
+# this repository (the build workflow syncs ``src/`` into ``./src`` inside the
+# staged add-on folder before building; see ha_addon_builder.yml).
 ARG BUILD_FROM
 FROM $BUILD_FROM
 

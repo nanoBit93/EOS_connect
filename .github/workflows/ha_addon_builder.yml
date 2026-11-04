@@ -78,6 +78,15 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
+      # The build context is the add-on folder (home-assistant/builder stages each
+      # add-on directory in isolation), so the application source is copied in here
+      # from the repository root: eos_connect/src is the pinned source snapshot the
+      # add-on ships, synced from src/ on every build.
+      - name: Sync application source into add-on folder
+        run: |
+          rsync -a --exclude='__pycache__/' --exclude='*.pyc' --exclude='data/' --exclude='config.yaml' --exclude='config.bak.yaml' --exclude='config.yaml.migrated.bak' src/ eos_connect/src/
+          git add eos_connect/src 2>/dev/null || true
+
       - name: Get information
         id: info
         uses: home-assistant/actions/helpers/info@master
