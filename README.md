@@ -75,8 +75,8 @@ Supported data sources and integrations:
    - EOS or EVopt server (can be installed as part of the setup; see below)
 
 2. **Install EOS Connect Add-on:**
-   - Add the [ohAnd/ha_addons](https://github.com/ohAnd/ha_addons) repository to your Home Assistant add-on store.
-   - Install the **EOS Connect** add-on from the store.
+   - Add the [nanoBit93/EOS_connect](https://github.com/nanoBit93/EOS_connect) repository to your Home Assistant add-on store (Settings → Apps → Repositories → Add).
+   - Install the **EOS connect** add-on from the store.
    - The built-in optimizer (`local_evopt`) works out of the box — no additional add-ons required.
 
 3. **(Optional) External optimization backend:**
