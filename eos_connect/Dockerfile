@@ -62,7 +62,7 @@ RUN if [ "$(uname -m)" = "x86_64" ]; then \
     fi
 
 # Copy the application source and finalize
-COPY ./eos_connect/src /app/src
+COPY ./src /app/src
 WORKDIR /app/src
 RUN echo "::group::Finalizing Application" && \
     echo "=== APPLICATION COPIED ===" && \

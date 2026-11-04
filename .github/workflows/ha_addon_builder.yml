@@ -4,7 +4,7 @@ name: Build EOS Connect add-on
 
 env:
   BUILD_ARGS: "--test"
-  MONITORED_FILES: "build.yaml config.yaml Dockerfile eos_connect/src"
+  MONITORED_FILES: "build.yaml config.yaml Dockerfile src"
 
 on:
   push:
