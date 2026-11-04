@@ -740,6 +740,10 @@ scripts/install_playwright_deps_userspace.sh      # the alternative, without roo
                         and run everything regardless &mdash; those are the gates, and they are never
                         narrowed. A sixth workflow, <code>docker-image.yml</code>, is manual-dispatch
                         only.</p>
+                    <p>The main image-publishing job requests <code>contents: write</code> for its automatic
+                        version commit and <code>packages: write</code> for GHCR. Keep those permissions on
+                        the publishing job only; the reusable test workflow remains read-only. The
+                        repository or organization Actions policy must allow the requested permissions.</p>
                 </div>
 
                 <div class="content-section">

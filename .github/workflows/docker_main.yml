@@ -31,6 +31,9 @@ jobs:
       full: true
 
   publish_image:
+    permissions:
+      contents: write
+      packages: write
     runs-on: ubuntu-24.04
     needs: tests
     steps:
