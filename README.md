@@ -7,6 +7,10 @@
 
 **For full documentation, guides, and configuration details, visit:**
 [https://ohAnd.github.io/EOS_connect/](https://ohAnd.github.io/EOS_connect/)
+---
+
+# DO NOT USE THIS REPO
+Consider this as an unofficial alpha version. I use it for testing changes even before they land on the dev version of EOS Connect. PLEASE USE THE OFFICAL ONES FROM **ohAnd**.
 
 ---
 
