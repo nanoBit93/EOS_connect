@@ -136,6 +136,8 @@ class ManagedLoad:
         self.last_demand = None
         self.last_release = None
         self.last_error = None
+        self.plan_anchor = None
+        self.plan_time_frame_base = None
 
     def _price_cap(self, entry, key):
         """ct/kWh is what a user can reason about; the planner wants EUR/Wh."""
@@ -296,9 +298,19 @@ class ManagedLoad:
         """Turn the minute- and hour-based config into slot counts for this resolution."""
         return PlanOptions(
             strategy=self.config.get("strategy"),
-            min_runtime_slots=self.min_runtime_slots(ctx),
+            min_runtime_slots=(
+                self.last_demand.min_runtime_slots
+                if self.last_demand is not None
+                and self.last_demand.min_runtime_slots is not None
+                else self.min_runtime_slots(ctx)
+            ),
             max_slots_per_day=self.max_slots_per_day(ctx),
-            max_price_eur_per_wh=self.max_price_eur_per_wh,
+            max_price_eur_per_wh=(
+                self.last_demand.value_eur_per_wh
+                if self.last_demand is not None
+                and self.last_demand.value_eur_per_wh is not None
+                else self.max_price_eur_per_wh
+            ),
         )
 
     def reconfigure(self, entry):
@@ -380,6 +392,8 @@ class ManagedLoad:
         deferred = defer_gate and _offerable(demand)
         if not (deferred and self.last_schedule_at is not None):
             self.last_plan = plan
+            self.plan_anchor = ctx.anchor
+            self.plan_time_frame_base = ctx.time_frame_base
         self.last_release = release
 
         if not any(plan):
@@ -402,6 +416,8 @@ class ManagedLoad:
         if len(plan) < ctx.slot_count:
             plan += [0.0] * (ctx.slot_count - len(plan))
         self.last_plan = plan[: ctx.slot_count]
+        self.plan_anchor = ctx.anchor
+        self.plan_time_frame_base = ctx.time_frame_base
         self.last_schedule_at = ctx.now
         # What the household actually pays extra, where the optimizer measured it. The
         # tariff of the occupied hours is the fallback, and only a rough guide: it
@@ -438,6 +454,8 @@ class ManagedLoad:
         planned_now = (
             0 <= ctx.current_slot < len(plan) and plan[ctx.current_slot] > 0
         )
+        if not active:
+            planned_now = False
         release = self.gate.evaluate(
             planned=planned_now,
             urgent=demand.urgent,
@@ -696,6 +714,8 @@ class ManagedLoad:
             "energy_needed_wh": round(demand.total_wh, 1) if demand else 0.0,
             "planned_wh": round(sum(self.last_plan), 1) if self.last_plan else 0.0,
             "plan": [round(value, 1) for value in self.last_plan],
+            "plan_anchor": self.plan_anchor.isoformat() if self.plan_anchor else None,
+            "time_frame_base": self.plan_time_frame_base,
             # Who placed this plan: the optimizer while its answers keep arriving, the
             # fallback once its silence has outlasted the staleness age. Read "who is
             # the planner", not a quality judgement.

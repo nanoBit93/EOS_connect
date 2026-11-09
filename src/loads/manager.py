@@ -228,6 +228,7 @@ class ManagedLoadManager:
         # Set when the optimizer can place contingent loads itself, which changes what
         # this module does with them: it computes the demand and defers the placing.
         self.external_scheduler = False
+        self.on_contingent_push = None
         self._last_ctx = None
         self._last_ctx_for = {}
         # Per-hour forecast-versus-sensor offset, one learner per instance.
@@ -240,6 +241,7 @@ class ManagedLoadManager:
         # Recent store temperatures, so the card can draw where the water has been as
         # well as where the plan takes it: id -> deque of (when, celsius).
         self._medium_history = {}
+        self._thermal_plan_versions = {}
         self._stop = threading.Event()
         self._thread = None
 
@@ -417,6 +419,7 @@ class ManagedLoadManager:
                 # optimizer kept planning around an appliance the user had disabled.
                 self.registry.drop(item.id)
                 self.registry.drop(standby_contribution_id(item.id))
+                self.invalidate_thermal_for_contingent(item.id)
                 continue
             ctx = self._context_for(item, ctx_base)
             self._last_ctx_for[item.id] = ctx
@@ -576,7 +579,13 @@ class ManagedLoadManager:
                 "max_power_w": float(demand.max_power_w),
                 "value_eur_per_wh": self._value_of(item),
                 "feasible": _padded(demand.feasible, slots),
-                "min_runtime_slots": item.min_runtime_slots(ctx) if ctx else 1,
+                "deadline_slot": demand.deadline_slot,
+                "min_runtime_slots": (
+                    demand.min_runtime_slots
+                    if demand.min_runtime_slots is not None
+                    else (item.min_runtime_slots(ctx) if ctx else 1)
+                ),
+                "contiguous": demand.contiguous,
                 "urgent_wh": float(demand.total_wh) if demand.urgent else 0.0,
                 "committed_on_slots": committed_on,
                 "committed_off_slots": committed_off,
@@ -694,6 +703,8 @@ class ManagedLoadManager:
         finite, so an unreachable target still degrades to a short plan rather than to
         an unbounded objective.
         """
+        if item.last_demand is not None and item.last_demand.value_eur_per_wh is not None:
+            return float(item.last_demand.value_eur_per_wh)
         if item.max_price_eur_per_wh is not None:
             return float(item.max_price_eur_per_wh)
         prices = self._series(self.sources.price, self.horizon_hours) or [0.0]
@@ -728,6 +739,13 @@ class ManagedLoadManager:
                     self._consume_budget(budget, other.last_plan)
 
         ctx = self._context_for(item, ctx_base)
+        if self.external_scheduler and item.kind_is_contingent():
+            # refresh() runs before the optimizer has answered this new offer.
+            # Its local placement is provisional until adopt_schedules(); an external
+            # consumer must not mistake it for the final solver placement.
+            item.fallback_active = True
+            if item.waiting_for_schedule_since is None:
+                item.waiting_for_schedule_since = ctx_base.now
         contribution, release = item.evaluate(ctx, budget_wh=budget)
         self._store_result(item, contribution, release)
         self._publish_standby(item, ctx)
@@ -1514,7 +1532,24 @@ class ManagedLoadManager:
         )
         item.accept_push(parsed, anchor, self.time_frame_base, source=source)
         logger.info("[LOADS] '%s' accepted a push via %s", entry_id, source)
+        if item.kind_is_contingent() and parsed.total_wh <= 0:
+            self.invalidate_thermal_for_contingent(entry_id)
         self.refresh(entry_id)
+        if (
+            item.kind_is_contingent()
+            and parsed.total_wh > 0
+            and self.on_contingent_push is not None
+        ):
+            # A new offer must reach the solver before the twin reads its placement.
+            # Waiting for the ordinary cadence would leave only the provisional
+            # fallback plan available for the thermal forecast. A zero-energy
+            # withdrawal is not a new offer and must not start another cycle.
+            try:
+                self.on_contingent_push(entry_id)
+            except Exception:  # pylint: disable=broad-except
+                logger.exception(
+                    "[LOADS] could not request an optimization after '%s'", entry_id
+                )
         return parsed
 
     def _pull_profile(self, item, ctx):
@@ -1593,6 +1628,7 @@ class ManagedLoadManager:
         cleared = item.clear_push()
         if cleared:
             self.registry.drop(entry_id)
+            self.invalidate_thermal_for_contingent(entry_id)
             self.refresh(entry_id)
         return cleared
 
@@ -1674,6 +1710,88 @@ class ManagedLoadManager:
         if medium is not None:
             status["water_series"] = medium
         return status
+
+    def invalidate_thermal_for_contingent(self, contingent_id):
+        """Remove the final-state claim when its linked contingent disappears."""
+        for item in self.instances:
+            thermal = getattr(getattr(item.model, "_push", None), "thermal", None)
+            if not isinstance(thermal, dict):
+                continue
+            if (thermal.get("plan") or {}).get("contingent_id") == contingent_id:
+                thermal["stale_plan"] = True
+
+    def thermal_forecasts(self):
+        """Optional external thermal forecasts, valid for their diagnostic horizon."""
+        _, now, _ = self._clock()
+        forecasts = {}
+        for item in self.instances:
+            getter = getattr(item.model, "thermal_forecast", None)
+            if getter is None:
+                continue
+            forecast = getter(now)
+            if forecast is not None:
+                forecasts[item.id] = forecast
+        return forecasts
+
+    def _plan_signatures(self, schedules, anchor):
+        """Plan identities in the same midnight-anchored slot space the twin uses."""
+        signatures = {}
+        for load_id, slots in (schedules or {}).items():
+            if not isinstance(slots, list):
+                continue
+            occupied = [index for index, value in enumerate(slots) if value > 0]
+            intervals = []
+            for index in occupied:
+                if not intervals or index != intervals[-1][1]:
+                    intervals.append([index, index + 1])
+                else:
+                    intervals[-1][1] = index + 1
+            interval_text = ",".join(f"{lo}-{hi}" for lo, hi in intervals)
+            signature = (
+                f"{anchor.isoformat()}|{interval_text}"
+                if occupied else None
+            )
+            signatures[load_id] = (signature, intervals)
+        return signatures
+
+    def update_thermal_plans(self, schedules, anchor, commit=True):
+        """Match thermal simulations to the plan being published.
+
+        A sidecar names its contingent, so unrelated external profiles stay valid.
+        The complete occupied intervals distinguish split blocks with equal endpoints.
+        Returns the ids whose contingent placement changed; the caller can then ask
+        the external simulator for a replacement without replanning an unchanged run.
+        """
+        signatures = self._plan_signatures(schedules, anchor)
+        changed = [
+            load_id for load_id, (signature, _intervals) in signatures.items()
+            if self._thermal_plan_versions.get(load_id, (None, []))[0] != signature
+            or not any(
+                (getattr(getattr(other.model, "_push", None), "thermal", None) or {}).get(
+                    "plan", {}
+                ).get("contingent_id") == load_id
+                and not (
+                    getattr(getattr(other.model, "_push", None), "thermal", None) or {}
+                ).get("stale_plan", False)
+                for other in self.instances
+            )
+        ]
+        for load_id, (signature, _intervals) in signatures.items():
+            for other in self.instances:
+                thermal = getattr(getattr(other.model, "_push", None), "thermal", None)
+                if not isinstance(thermal, dict):
+                    continue
+                plan = thermal.get("plan") or {}
+                contingent_id = plan.get("contingent_id")
+                if contingent_id != load_id:
+                    continue
+                if plan.get("signature") == signature:
+                    thermal["stale_plan"] = False
+                else:
+                    thermal["stale_plan"] = True
+        if commit:
+            self._thermal_plan_versions = signatures
+        return changed
 
     def status(self):
         """The whole subsystem, for `GET /api/managed_loads` and the dashboard."""

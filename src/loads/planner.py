@@ -1,10 +1,10 @@
 """
 Placing an energy contingent into the cheapest slots it is allowed to occupy.
 
-The optimizer decides how to *source* energy - grid, battery, PV. It does not decide
-when a pool heat pump should run, and for the local EVopt backends it cannot: neither
-supports even the single schedulable appliance the EOS server does. So a managed load
-brings its own placement, and this module is it.
+The optimizer decides how to *source* energy - grid, battery, PV. When the built-in
+optimizer can schedule managed loads itself, it also decides when they run. This
+module supplies the explicit fallback placement for the other backends and for a
+solver that has not answered within its scheduling cadence.
 
 The rule is deliberately simple and explainable, because the user has to be able to look
 at the dashboard and understand why the pump is running at 13:00: rank the slots the
@@ -221,8 +221,14 @@ def _candidates(demand, ctx, caps, costs, options, reasons):
     return usable, priced_out
 
 
-def _blocks(candidates, length):
-    """Contiguous runs of exactly *length* candidate slots."""
+def _blocks(candidates, length, start_only=False, end=None):
+    """Contiguous runs, optionally anchored at a single permitted start."""
+    if start_only:
+        return [
+            list(range(index, index + length))
+            for index in candidates
+            if end is not None and index + length <= end
+        ]
     if length <= 1:
         return [[index] for index in candidates]
     available = set(candidates)
@@ -282,15 +288,39 @@ def plan_contingent(demand, ctx, options, budget_wh=None):
         )
         return plan
 
-    if demand.urgent:
+    if demand.urgent and not demand.contiguous:
         # Cheapness is worthless if the pool freezes: take the next slots available.
         ordered = sorted(candidates)
         plan = _fill(plan, ordered, caps, remaining, options, ctx, reasons)
         demand.plan_price_eur_per_wh = plan_price(plan, _numeric_costs(costs, options))
         return plan
 
-    ordered_blocks = _blocks(candidates, options.min_runtime_slots)
+    ordered_blocks = _blocks(
+        candidates,
+        options.min_runtime_slots,
+        demand.contiguous,
+        end=(
+            min(
+                length,
+                int(demand.deadline_slot) + 1
+                if demand.deadline_slot is not None
+                else length,
+            )
+            if demand.contiguous
+            else None
+        ),
+    )
     if not ordered_blocks:
+        if demand.contiguous:
+            # A digital twin requested a complete operating window. Falling back
+            # to scattered slots would create precisely the short cycling that
+            # its simulated duration is meant to prevent.
+            logger.info(
+                "[LOADS] no complete contiguous run of %d slots available - "
+                "leaving the external offer unplaced",
+                options.min_runtime_slots,
+            )
+            return plan
         # The window is shorter than the minimum runtime. Running for less is better
         # than not running at all, so fall back to single slots and say so.
         logger.info(
@@ -301,6 +331,25 @@ def plan_contingent(demand, ctx, options, budget_wh=None):
         ordered_blocks = [[index] for index in candidates]
 
     ordered_blocks.sort(key=lambda run: (_block_cost(run, costs), run[0]))
+
+    # A twin-requested block is atomic: select its best candidate whole, rather
+    # than consuming its budget while collecting possible future alternatives.
+    # Spread its offered energy over every slot so the release signal covers the
+    # complete simulated setpoint window instead of stopping after the first
+    # slot that happens to be large enough for the total energy.
+    if demand.contiguous:
+        share = float(demand.total_wh) / options.min_runtime_slots
+        if any(share > caps[slot] + 1e-6 for slot in ordered_blocks[0]):
+            logger.info(
+                "[LOADS] complete contiguous block exceeds the available power budget - "
+                "leaving the external offer unplaced"
+            )
+            return plan
+        for slot in ordered_blocks[0]:
+            plan[slot] = share
+            reasons[slot] = SLOT_PLANNED
+        demand.plan_price_eur_per_wh = plan_price(plan, _numeric_costs(costs, options))
+        return plan
 
     order = []
     seen = set()
@@ -316,10 +365,15 @@ def plan_contingent(demand, ctx, options, budget_wh=None):
                 order.append(slot)
         remaining -= sum(caps[slot] for slot in fresh)
 
-    # Anything the blocks could not cover falls back to the cheapest leftover slots.
-    leftovers = [index for index in candidates if index not in seen]
-    leftovers.sort(key=lambda index: (costs[index], index))
-    order.extend(leftovers)
+    # A complete external block is already the full operating window. Never add
+    # isolated leftover slots after it; ordinary managed loads keep their behavior.
+    if demand.contiguous:
+        order = list(ordered_blocks[0])
+    else:
+        # Anything the blocks could not cover falls back to the cheapest leftover slots.
+        leftovers = [index for index in candidates if index not in seen]
+        leftovers.sort(key=lambda index: (costs[index], index))
+        order.extend(leftovers)
 
     plan = _fill(plan, order, caps, float(demand.total_wh), options, ctx, reasons)
     demand.plan_price_eur_per_wh = plan_price(plan, _numeric_costs(costs, options))

@@ -137,6 +137,29 @@
                             <em>Additional Load</em>, which models a shiftable appliance such as a
                             dishwasher &mdash; a runtime and a total, for the optimizer to place. Do not
                             configure the same sensor as both.</p>
+                        <p>An external profile can additionally carry a <code>thermal</code> object with
+                            <code>start</code>, <code>resolution</code> and a <code>series</code> object:
+                            <code>buffer_c</code>, <code>dhw_c</code>, <code>outdoor_c</code> and
+                            <code>mode</code> per slot. EOS Connect then shows a temperature chart below
+                            the existing energy chart. It uses the final adopted SG3/SG2 forecast,
+                            including the following cooldown and normal heating runs. Temperatures are
+                            averaged by time overlap; missing values remain empty. The operating band shows
+                            the fraction of each slot with actual heat-pump power above the model's
+                            configured running threshold, including a partial first or last slot. Its height
+                            follows the operating time, so a partially active slot does not cover the whole
+                            subsequent cooldown. The tooltip gives the simulated share of the slot during
+                            which the heat pump runs. The band follows the same deterministic reference
+                            simulation as the temperatures, rather than mixing shifted Monte-Carlo runs
+                            into apparent rapid cycling. Its slot values share the temperature forecast's
+                            absolute start time and are rotated exactly once.
+                            The data is diagnostic
+                            only, is not sent to the optimizer, and is removed when the profile is cleared.</p>
+                        <p>When the simulation belongs to an SG3 energy budget, its
+                            <code>thermal.plan</code> identifies that budget and the adopted EOS block.
+                            A moved, interrupted or removed plan invalidates its old temperature curve;
+                            a new matching simulation appears at the next dashboard refresh. An unchanged
+                            plan keeps its curve. Other external profiles are not affected. No optimizer
+                            or hardware control waits for this diagnostic simulation.</p>
                         <p><strong>One name is excluded from this:</strong> an EVCC loadpoint series
                             (<code>group:loadpoint:&lt;title&gt;</code> or the whole
                             <code>group:loadpoint</code> group). EVCC meters its household consumption
@@ -765,6 +788,92 @@ attributes:
                         <a href="#profile-external-contingent">External energy budget</a> takes. It is the
                         one pushed shape that is scheduled rather than injected, so it gets a
                         released / blocked signal like a heated store.</p>
+
+                    <h4 id="managed-loads-flexibility">Externally simulated flexibility</h4>
+                    <p>A digital twin can describe not just how much energy it needs, but where a run may
+                        start, how much power it draws and what avoiding the alternative is worth. Add
+                        these optional fields to the <code>total_wh</code> payload:</p>
+                    <pre><code>{
+  "total_wh": 3200,
+  "deadline": "2026-06-01T14:30:00+02:00",
+  "min_runtime_slots": 8,
+  "contiguous": true,
+  "max_power_w": 3600,
+  "feasible": [false, true, true, false],
+  "start": "2026-06-01T10:00:00+02:00",
+  "resolution": "15min",
+  "value_eur_per_kwh": 0.25,
+  "ttl_minutes": 60
+}</code></pre>
+                    <ul>
+                        <li><code>feasible</code> contains real JSON booleans and marks <strong>permitted
+                            start slots</strong>. For an ordinary managed load, EOS Connect also
+                            requires the following slots needed for the configured minimum runtime.
+                            For a contiguous externally simulated offer the mask instead describes
+                            starts only: the twin has already proved the complete operation, so an
+                            accepted start may occupy its full block through following slots that
+                            must not start another run. The block still has to fit the horizon and
+                            deadline. Slots outside the supplied window are blocked, and converting
+                            to an hourly optimizer uses <em>all</em>: one blocked quarter-hour blocks
+                            that hour.</li>
+                        <li><code>start</code> anchors the first mask entry to an ISO timestamp, or use
+                            <code>"now"</code>/<code>"today"</code>. <code>resolution</code> accepts
+                            <code>"15min"</code> or <code>"hourly"</code>. This explicit anchor avoids
+                            confusing the next 192 slots with the 192 slots from local midnight.</li>
+                        <li><code>deadline</code> is an optional ISO timestamp for the end of the
+                            simulated operating window. A slot ending exactly at that instant remains
+                            available. The older <code>deadline_hours</code> form remains supported as a
+                            duration from the current planning slot; send only one of the two.</li>
+                        <li><code>min_runtime_slots</code> and <code>contiguous: true</code> request one
+                            complete, uninterrupted operating window. The energy is distributed across
+                            that window; it is <strong>not</strong> a demand for rated power in every
+                            slot. If no complete block fits before the deadline, the contingent is not
+                            shortened or split. A heat-pump twin must simulate a complete operation to
+                            its measured HK1 target before offering this duration; a free 15-minute
+                            slot is not a completed heating run. A short early stop caused by an actual
+                            plant constraint is different from deliberately planning such a short run.</li>
+                        <li><code>max_power_w</code> is the electrical power ceiling in watts and overrides
+                            the load's rated power for this push.</li>
+                        <li><code>value_eur_per_kwh</code> is the <strong>gross avoided cost per additional
+                            kWh</strong>, before the electricity needed for the flexible run. It is not the
+                            net saving after that electricity and not the tariff itself. The built-in
+                            optimizer compares this value with the actual marginal supply cost from grid,
+                            forgone export or a battery charged for the purpose. Supply costs are therefore
+                            counted exactly once.</li>
+                    </ul>
+                    <p>The deadline is enforced by both the fallback planner and the built-in optimizer.
+                        With a value of zero the optimizer may leave the contingent unplaced; it is an
+                        economic upper bound on the energy's benefit, not an <em>urgent</em> flag. A
+                        minimum runtime of zero does not force full-power slots: the optimizer may place
+                        a partial slot, and its ordinary start-cost tie-breaker still discourages needless
+                        switching. Set a real minimum runtime when the appliance must run at rated power
+                        for a contiguous block.</p>
+                    <p>A placement returned in <code>plan[]</code> contains <strong>Wh per slot</strong>.
+                        The status also includes <code>plan_anchor</code> and
+                        <code>time_frame_base</code>. Use both when translating the plan back into
+                        timestamps. If a final load profile replaces an adopted contingent, withdraw or
+                        zero the contingent first: the same energy must not remain in both.</p>
+                    <div class="alert alert-info">
+                        <p><strong>Heat-pump twin setup:</strong> use the built-in
+                            <code>local_evopt</code> optimizer with <code>eos.time_frame = 900</code>.
+                            Create two managed loads with different IDs. The contingent
+                            (<code>sg3_req</code>) is an <em>External energy budget</em>; leave
+                            <em>Replaces sensor</em> empty there because it carries only additional
+                            energy. The final whole-heat-pump profile (<code>hp_ext</code>) is an
+                            <em>External load profile</em> with source <em>push</em> and its heat-pump
+                            power sensor as <em>Replaces sensor</em>. The twin offers the additional
+                            energy within the verified SG3 heating run, not the horizon-wide net
+                            difference. SG3 may shift consumption without saving energy; EOS values that
+                            shift through its actual supply costs. The twin calibrates the elevated-target
+                            compressor stop separately from normal SG2 operation and discards a run that
+                            cannot reach its target within its simulated limit. It reports the actual
+                            compressor runtime and following off interval separately from the elevated
+                            setpoint window. Both loads have a TTL and a rated-power setting; a push
+                            can override rated power and valuation for its validity period. The twin
+                            supplies that full simulated compressor runtime and an absolute deadline for
+                            the end of the elevated setpoint window, so the configured minimum runtime
+                            on the contingent can remain zero.</p>
+                    </div>
 
                     <h4 id="managed-loads-replaces-sensor">Extra load, or the whole appliance?</h4>
                     <p>This is the one thing worth getting right, and it is invisible from the sending

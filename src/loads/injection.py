@@ -31,9 +31,19 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 try:  # running from src/ as a script — src/ is on sys.path
-    from timeseries_grid import KIND_EXTENSIVE, TimeseriesGridError, place_on_grid
+    from timeseries_grid import (
+        KIND_EXTENSIVE,
+        KIND_INTENSIVE,
+        TimeseriesGridError,
+        place_on_grid,
+    )
 except ImportError:  # imported as src.loads (tests)
-    from ..timeseries_grid import KIND_EXTENSIVE, TimeseriesGridError, place_on_grid
+    from ..timeseries_grid import (
+        KIND_EXTENSIVE,
+        KIND_INTENSIVE,
+        TimeseriesGridError,
+        place_on_grid,
+    )
 
 from .contribution import MAX_SLOT_WH, ttl_from_minutes
 
@@ -77,15 +87,26 @@ class PushedProfile:
     valid_until: datetime
     source_resolution_s: int
     source_length: int
+    thermal: dict | None = None
 
 
 @dataclass
 class PushedContingent:
-    """An energy budget for the planner to place."""
+    """An energy budget for the planner to place.
+
+    ``feasible`` uses EOS slot space (local midnight), not the solver's rotated
+    horizon. ``value_eur_per_wh`` is the gross avoided cost of additional energy:
+    the optimizer still accounts for supplying that energy, exactly once.
+    """
 
     total_wh: float
     deadline_slot: object
     valid_until: datetime
+    feasible: list | None = None
+    value_eur_per_wh: float | None = None
+    max_power_w: float | None = None
+    min_runtime_slots: int | None = None
+    contiguous: bool = False
 
 
 def _as_number(value, label):
@@ -205,6 +226,183 @@ def _place(values, start_slot, slot_count):
     return placed, dropped
 
 
+def _feasible_mask(payload, anchor, slot_count, time_frame_base, current_slot):
+    """Align a caller's boolean start mask to EOS's midnight-anchored slot space.
+
+    Splitting an hourly mask repeats its value; aggregating to hourly uses ``all`` so
+    one blocked quarter-hour blocks the entire hour. Slots outside the supplied window
+    are denied, including the past - an external safety mask must never fail open.
+    """
+    if "feasible" not in payload or payload["feasible"] is None:
+        return None
+    raw = payload["feasible"]
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raise InjectionError("'feasible' must be a non-empty array of booleans")
+    if len(raw) > _MAX_SERIES_LENGTH:
+        raise InjectionError(f"'feasible' has more than {_MAX_SERIES_LENGTH} entries")
+    for index, value in enumerate(raw):
+        if not isinstance(value, bool):
+            raise InjectionError(f"'feasible[{index}]' must be true or false")
+
+    source_base = _resolve_resolution(payload, len(raw))
+    if source_base > time_frame_base:
+        factor = source_base // time_frame_base
+        values = [value for value in raw for _ in range(factor)]
+    else:
+        factor = time_frame_base // source_base
+        if factor * source_base != time_frame_base:
+            raise InjectionError("the 'feasible' resolution does not fit the optimizer grid")
+        values = [all(raw[i:i + factor]) for i in range(0, len(raw), factor)]
+
+    start_slot = _resolve_start_slot(payload, anchor, current_slot, source_base)
+    placed = [False] * slot_count
+    for index, allowed in enumerate(values):
+        target = start_slot + index
+        if 0 <= target < slot_count:
+            placed[target] = bool(allowed)
+    return placed
+
+
+def _thermal_series(payload, anchor, slot_count, time_frame_base, valid_until):
+    """Validate and place an optional simulated thermal sidecar.
+
+    Temperature is intensive: it is averaged by overlap, never summed like Wh.
+    Uncovered slots remain None, not a fictitious zero-degree measurement.
+    """
+    raw = payload.get("thermal")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise InjectionError("'thermal' must be an object")
+    series = raw.get("series")
+    if not isinstance(series, dict) or not series:
+        raise InjectionError("'thermal.series' must be a non-empty object")
+    source_base = _resolve_resolution(raw, 192)
+    raw_start = raw.get("start", "today")
+    if isinstance(raw_start, str) and raw_start.strip().lower() not in (
+        "", "today", "midnight", "now",
+    ):
+        try:
+            start = datetime.fromisoformat(raw_start.strip())
+        except ValueError as exc:
+            raise InjectionError("'thermal.start' must be an ISO timestamp") from exc
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=anchor.tzinfo)
+    else:
+        start_slot = _resolve_start_slot(raw, anchor, 0, source_base)
+        start = anchor + timedelta(seconds=start_slot * source_base)
+    limit = slot_count * time_frame_base
+    if limit <= 0:
+        return None
+    # A two-hour electrical/contingent TTL must not truncate the diagnostic
+    # cooldown after SG3. The last final simulation remains visible until a new
+    # push replaces it; a clear still removes it immediately. Its own diagnostic
+    # horizon is bounded separately from the contingent's scheduling lifetime.
+    diagnostic_valid_until = max(valid_until, start + timedelta(hours=48))
+    output = {}
+    start_index = int((start - anchor).total_seconds() // time_frame_base)
+    for name, values in series.items():
+        if name == "mode":
+            continue
+        if not isinstance(name, str) or not name.endswith("_c"):
+            raise InjectionError("'thermal.series' keys must be temperature '*_c' series")
+        if not isinstance(values, list) or not values or len(values) > _MAX_SERIES_LENGTH:
+            raise InjectionError(f"'thermal.series.{name}' must be a non-empty array")
+        if source_base == time_frame_base:
+            output[name] = [None] * slot_count
+            for index, value in enumerate(values):
+                target = start_index + index
+                if not 0 <= target < slot_count or value is None:
+                    continue
+                number = _as_number(value, f"thermal.series.{name}[{index}]")
+                if not -50.0 <= number <= 130.0:
+                    raise InjectionError(f"'thermal.series.{name}' is outside -50..130 °C")
+                if (target + 1) * time_frame_base <= limit + 1e-6:
+                    output[name][target] = round(number, 3)
+            continue
+        entries = []
+        for index, value in enumerate(values):
+            if value is None:
+                continue
+            number = _as_number(value, f"thermal.series.{name}[{index}]")
+            if not -50.0 <= number <= 130.0:
+                raise InjectionError(f"'thermal.series.{name}' is outside -50..130 °C")
+            begin = start + timedelta(seconds=index * source_base)
+            entries.append({"start": begin, "end": begin + timedelta(seconds=source_base), "value": number})
+        try:
+            placed = place_on_grid(entries, anchor, slot_count, time_frame_base, KIND_INTENSIVE)
+        except TimeseriesGridError as exc:
+            raise InjectionError(str(exc)) from exc
+        output[name] = [
+            round(value, 3) if coverage > 0 and index * time_frame_base < limit else None
+            for index, (value, coverage) in enumerate(zip(placed.values, placed.coverage))
+        ]
+    modes = series.get("mode")
+    if modes is not None:
+        if not isinstance(modes, list) or len(modes) > _MAX_SERIES_LENGTH:
+            raise InjectionError("'thermal.series.mode' must be an array")
+        allowed = {"idle", "heat", "dhw", "pause", "defrost"}
+        if any(not isinstance(value, str) or value not in allowed for value in modes):
+            raise InjectionError("'thermal.series.mode' has an unknown operating state")
+        output["mode"] = [None] * slot_count
+        for index, mode in enumerate(modes):
+            target = int(round(((start + timedelta(seconds=index * source_base)) - anchor).total_seconds() / time_frame_base))
+            if 0 <= target < slot_count and target * time_frame_base < limit:
+                previous = output["mode"][target]
+                # Occupancy, not a majority vote: an aggregated slot must keep
+                # any real heat/DHW operation, including its first partial slot.
+                if previous is None or (
+                    mode in ("heat", "dhw") and previous not in ("heat", "dhw")
+                ) or (mode == "dhw" and previous == "heat"):
+                    output["mode"][target] = mode
+    plan = raw.get("plan")
+    if plan is not None and not isinstance(plan, dict):
+        raise InjectionError("'thermal.plan' must be an object")
+    probability = raw.get("run_probability")
+    if probability is not None:
+        if not isinstance(probability, list) or len(probability) > _MAX_SERIES_LENGTH:
+            raise InjectionError("'thermal.run_probability' must be an array")
+        placed_probability = [None] * slot_count
+        if source_base == time_frame_base:
+            for index, value in enumerate(probability):
+                number = _as_number(value, f"thermal.run_probability[{index}]")
+                if not 0.0 <= number <= 1.0:
+                    raise InjectionError("'thermal.run_probability' must be between 0 and 1")
+                target = start_index + index
+                if 0 <= target < slot_count and target * time_frame_base < limit:
+                    placed_probability[target] = round(number, 4)
+        else:
+            entries = []
+            for index, value in enumerate(probability):
+                number = _as_number(value, f"thermal.run_probability[{index}]")
+                if not 0.0 <= number <= 1.0:
+                    raise InjectionError("'thermal.run_probability' must be between 0 and 1")
+                begin = start + timedelta(seconds=index * source_base)
+                entries.append({
+                    "start": begin,
+                    "end": begin + timedelta(seconds=source_base),
+                    "value": number,
+                })
+            placed = place_on_grid(
+                entries, anchor, slot_count, time_frame_base, KIND_INTENSIVE
+            )
+            placed_probability = [
+                round(value, 4) if coverage > 0 else None
+                for value, coverage in zip(placed.values, placed.coverage)
+            ]
+        probability = placed_probability
+    return {
+        "start": start.isoformat(),
+        "series": output,
+        "valid_until": diagnostic_valid_until.isoformat(),
+        "plan": plan,
+        "run_probability": probability,
+        "running_threshold_w": _as_number(
+            raw.get("running_threshold_w", 200.0), "thermal.running_threshold_w"
+        ),
+    }
+
+
 def parse_push(payload, anchor, slot_count, time_frame_base, current_slot,
                default_ttl_minutes=1440, now=None):
     """
@@ -228,31 +426,89 @@ def parse_push(payload, anchor, slot_count, time_frame_base, current_slot,
     valid_until = ttl_from_minutes(payload.get("ttl_minutes", default_ttl_minutes), now=now)
 
     if "total_wh" in payload:
-        return _parse_contingent(payload, slot_count, time_frame_base, current_slot, valid_until)
+        return _parse_contingent(
+            payload, anchor, slot_count, time_frame_base, current_slot, valid_until
+        )
 
     return _parse_profile(
         payload, anchor, slot_count, time_frame_base, current_slot, valid_until
     )
 
 
-def _parse_contingent(payload, slot_count, time_frame_base, current_slot, valid_until):
+def _parse_contingent(payload, anchor, slot_count, time_frame_base, current_slot, valid_until):
     """The "I need X Wh by T" form - the planner decides where it goes."""
     total = _as_number(payload["total_wh"], "total_wh")
     if total < 0:
         raise InjectionError("'total_wh' cannot be negative")
 
     deadline_slot = None
-    if payload.get("deadline_hours") is not None:
+    if payload.get("deadline") is not None and payload.get("deadline_hours") is not None:
+        raise InjectionError("use either 'deadline' or 'deadline_hours', not both")
+    if payload.get("deadline") is not None:
+        raw_deadline = payload["deadline"]
+        if not isinstance(raw_deadline, str):
+            raise InjectionError("'deadline' must be an ISO timestamp")
+        try:
+            deadline = datetime.fromisoformat(raw_deadline.strip())
+        except ValueError as exc:
+            raise InjectionError("'deadline' must be an ISO timestamp") from exc
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=anchor.tzinfo)
+        # The deadline belongs to the mask's explicit start anchor. Its slots
+        # retain the same midnight origin, so the last slot ending at or before
+        # this instant is the final permitted one.
+        deadline_slot = min(
+            slot_count - 1,
+            int(math.ceil((deadline - anchor).total_seconds() / time_frame_base)) - 1,
+        )
+    elif payload.get("deadline_hours") is not None:
         hours = _as_number(payload["deadline_hours"], "deadline_hours")
         if hours <= 0:
             raise InjectionError("'deadline_hours' must be positive")
+        # Backward-compatible relative form: the duration starts at the current
+        # planning slot and ends on the midnight-anchored EOS grid. The last slot
+        # must end at or before the deadline, not extend one slot beyond it.
         deadline_slot = min(
             slot_count - 1,
-            current_slot + int(round(hours * 3600 / time_frame_base)),
+            current_slot + max(0, int(math.ceil(hours * 3600 / time_frame_base))) - 1,
         )
 
+    value = None
+    if payload.get("value_eur_per_kwh") is not None:
+        value = _as_number(payload["value_eur_per_kwh"], "value_eur_per_kwh") / 1000.0
+        if value < 0:
+            raise InjectionError("'value_eur_per_kwh' cannot be negative")
+
+    power = None
+    if payload.get("max_power_w") is not None:
+        power = _as_number(payload["max_power_w"], "max_power_w")
+        if power <= 0:
+            raise InjectionError("'max_power_w' must be positive")
+
+    min_runtime_slots = None
+    if payload.get("min_runtime_slots") is not None:
+        raw_slots = payload["min_runtime_slots"]
+        if isinstance(raw_slots, bool) or not isinstance(raw_slots, int):
+            raise InjectionError("'min_runtime_slots' must be an integer")
+        if raw_slots < 1 or raw_slots > slot_count:
+            raise InjectionError("'min_runtime_slots' must fit the optimization horizon")
+        min_runtime_slots = raw_slots
+    contiguous = payload.get("contiguous", False)
+    if not isinstance(contiguous, bool):
+        raise InjectionError("'contiguous' must be true or false")
+    if min_runtime_slots is not None and deadline_slot is not None:
+        if deadline_slot - current_slot + 1 < min_runtime_slots:
+            raise InjectionError("'min_runtime_slots' cannot fit before the deadline")
+
     return PushedContingent(
-        total_wh=total, deadline_slot=deadline_slot, valid_until=valid_until
+        total_wh=total,
+        deadline_slot=deadline_slot,
+        valid_until=valid_until,
+        feasible=_feasible_mask(payload, anchor, slot_count, time_frame_base, current_slot),
+        value_eur_per_wh=value,
+        max_power_w=power,
+        min_runtime_slots=min_runtime_slots,
+        contiguous=contiguous,
     )
 
 
@@ -318,6 +574,7 @@ def _parse_profile(payload, anchor, slot_count, time_frame_base, current_slot, v
         valid_until=valid_until,
         source_resolution_s=source_base,
         source_length=len(numbers),
+        thermal=_thermal_series(payload, anchor, slot_count, time_frame_base, valid_until),
     )
 
 

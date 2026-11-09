@@ -11,9 +11,14 @@ which is the stored array rotated and cut; a band that makes that trip different
 the Load bar lines up with the wrong hours and looks entirely reasonable doing it.
 """
 
+from pathlib import Path
+
 import pytest
 
 import tests.web.wizard_driver as wz  # noqa: F401  (keeps the shared skip behaviour)
+
+
+CHART_DIR = Path(__file__).parents[2] / "src" / "web" / "js"
 
 
 def _align(page, series, slot, length, base):
@@ -306,3 +311,104 @@ def test_an_absent_forecast_key_still_leaves_the_band_empty(page):
     result = _run_update(page, *_fixtures())
     assert "error" not in result, result.get("error")
     assert result["managed"] == []
+
+
+def test_the_thermal_chart_stays_inside_its_card_without_a_large_gap(page):
+    """The axes belong inside the grey card, not below it behind the schedule."""
+    boxes = page.evaluate(
+        """() => {
+            const card = document.querySelector('.left-box').getBoundingClientRect();
+            const energy = document.getElementById('energyChart').getBoundingClientRect();
+            const panel = document.getElementById('thermal_chart_panel');
+            panel.style.display = 'block';
+            const thermal = panel.getBoundingClientRect();
+            const canvas = document.getElementById('thermalChart').getBoundingClientRect();
+            return {
+                cardBottom: card.bottom,
+                energyBottom: energy.bottom,
+                panelTop: thermal.top,
+                thermalBottom: thermal.bottom,
+                canvasBottom: canvas.bottom,
+            };
+        }"""
+    )
+    assert boxes["thermalBottom"] <= boxes["cardBottom"]
+    assert boxes["canvasBottom"] <= boxes["cardBottom"]
+    assert boxes["panelTop"] - boxes["energyBottom"] <= 70
+
+
+def test_operating_band_preserves_fractional_slot_occupancy(page):
+    """A partial first or last slot must not become a full-width binary block."""
+    request, response, controls = _fixtures()
+    response["thermal_forecast"] = {
+        "heating": {
+            "series": {
+                "buffer_c": [30.0] * 192,
+                "dhw_c": [45.0] * 192,
+                "outdoor_c": [8.0] * 192,
+                "mode": ["heat"] * 192,
+            },
+            "run_probability": [0.2, 0.0] + [0.0] * 190,
+            "running_threshold_w": 200.0,
+        }
+    }
+    result = page.evaluate(
+        """([request, response, controls]) => {
+            const manager = new ChartManager();
+            manager.chartInstance = {
+                data: {labels: [], datasets: Array.from({length: 14}, () => ({data: []}))},
+                options: {plugins: {legend: {}}, scales: Object.fromEntries(
+                    ['x', 'y', 'y1', 'y2', 'y3'].map(name => [name, {title: {}, ticks: {}}])
+                )},
+                update: () => {},
+            };
+            manager.updateChart(request, response, controls, null);
+            const chart = manager.thermalChartInstance;
+            return chart?.data.datasets.find(dataset => dataset.yAxisID === 'operating')?.data;
+        }""",
+        [request, response, controls],
+    )
+    assert result[:2] == [0.2, 0.0]
+    assert set(result[2:]) == {0.0}
+
+
+def test_thermal_plot_padding_compensates_for_the_energy_charts_second_axis():
+    """A second right-hand axis must not make the two plot widths disagree."""
+    source = (CHART_DIR / "chart.js").read_text(encoding="utf-8")
+    assert "energy.scales.y2.width" in source
+    assert "this.alignThermalPlotArea()" in source
+
+
+def test_the_first_thermal_label_matches_the_energy_run_time(page):
+    """The first visible slot must not be named a quarter-hour earlier below."""
+    request, response, controls = _fixtures()
+    response["thermal_forecast"] = {
+        "heating": {
+            "series": {
+                "buffer_c": [30.0] * 192,
+                "dhw_c": [45.0] * 192,
+                "outdoor_c": [8.0] * 192,
+                "mode": ["idle"] * 192,
+            },
+            "run_probability": [0.0] * 192,
+        }
+    }
+    result = page.evaluate(
+        """([request, response, controls]) => {
+            const manager = new ChartManager();
+            manager.chartInstance = {
+                data: {labels: [], datasets: Array.from({length: 14}, () => ({data: []}))},
+                options: {plugins: {legend: {}}, scales: Object.fromEntries(
+                    ['x', 'y', 'y1', 'y2', 'y3'].map(name => [name, {title: {}, ticks: {}}])
+                )},
+                update: () => {},
+            };
+            manager.updateChart(request, response, controls, null);
+            return {
+                energy: manager.chartInstance.data.labels[0],
+                thermal: manager.thermalChartInstance?.data.labels[0],
+            };
+        }""",
+        [request, response, controls],
+    )
+    assert result["energy"] == result["thermal"]

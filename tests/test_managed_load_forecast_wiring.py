@@ -107,3 +107,66 @@ def test_the_response_carries_the_split_to_the_chart(tree):
 def test_the_chart_reads_the_key_python_writes():
     """A rename on one side of this boundary is a silently empty band on the other."""
     assert f'"{KEY}"' in CHART.read_text(encoding="utf-8")
+
+
+def test_final_thermal_forecast_reaches_the_separate_temperature_chart(tree):
+    """The UI receives the adopted thermal simulation, not a new optimizer input."""
+    key = "thermal_forecast"
+    assert any(
+        f"optimized_response['{key}']" in ast.unparse(node)
+        and "load_manager.thermal_forecasts()" in ast.unparse(node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+    )
+    chart = CHART.read_text(encoding="utf-8")
+    assert f'data_response?.{key}' in chart
+    assert "thermalChart" in chart
+
+
+def test_new_thermal_push_replaces_only_the_diagnostic_part_of_the_response(tree):
+    """An asynchronous twin push reaches the next dashboard poll, not the next solve."""
+    reader = _function(tree, "get_optimize_response")
+    body = ast.unparse(reader)
+    assert "update_thermal_plans" in body
+    assert "thermal_forecast" in body
+    assert "_response_lock" in body
+    assert "request_immediate_run" not in body
+
+
+def test_stale_thermal_is_filtered_before_the_optimizer_response_is_published(tree):
+    """No snapshot can claim the old thermal trace belongs to the newly moved plan."""
+    response = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and ast.unparse(node).startswith(
+            "optimized_response['thermal_forecast'] = load_manager.thermal_forecasts()"
+        )
+    )
+    enclosing = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "__run_optimization_loop"
+    )
+    statements = [
+        node for node in ast.walk(enclosing)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "update_thermal_plans"
+    ]
+    assert len(statements) == 1
+    assert statements[0].lineno < response.lineno
+
+
+def test_plan_invalidation_does_not_consume_the_refresh_trigger(tree):
+    """The same new plan must still be new when the refresh callback checks it."""
+    callback = _function(tree, "_refresh_external_thermal_plan")
+    body = ast.unparse(callback)
+    assert "changed = load_manager.update_thermal_plans" in body
+    assert "if not changed" in body
+    manager_source = pathlib.Path("src/loads/manager.py")
+    manager_tree = ast.parse(manager_source.read_text(encoding="utf-8"))
+    invalidation = next(
+        node for node in ast.walk(manager_tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "update_thermal_plans"
+    )
+    assert "if commit" in ast.unparse(invalidation)

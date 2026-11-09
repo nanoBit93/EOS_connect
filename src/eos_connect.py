@@ -819,6 +819,43 @@ def publish_managed_load_release(load_id, release):
     mqtt_interface.update_publish_topics(managed_load_topics.build_values(load_manager))
 
 
+def _refresh_external_thermal_plan(schedules, anchor):
+    """Request one thermal update when EOS publishes a different plan.
+
+    The callback belongs after schedule adoption, where the response is the final
+    optimizer answer rather than the push-time fallback.
+    """
+    import urllib.request
+
+    changed = load_manager.update_thermal_plans(schedules, anchor, commit=False)
+    # Commit only after the refresh request has been decided. Committing in the
+    # preceding staleness check would make the same change look already handled.
+    load_manager._thermal_plan_versions = load_manager._plan_signatures(
+        schedules, anchor
+    )
+    if not changed:
+        return
+    import os
+
+    url = os.environ.get("EOS_HP_TWIN_LOCAL_URL", "").strip()
+    if not url or not url.startswith(("http://127.0.0.1:", "http://localhost:")):
+        return
+    try:
+        req = urllib.request.Request(
+            url.rstrip("/") + "/api/push_now",
+            data=b'{"push": true}',
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=3) as response:
+            logger.info(
+                "[Main] hp-twin thermal-plan refresh requested: HTTP %s",
+                response.status,
+            )
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("[Main] hp-twin thermal-plan refresh failed: %s", exc)
+
+
 load_manager.sources = ManagedLoadSources(
     read_sensor=_managed_load_read_sensor,
     read_sensor_details=_managed_load_read_sensor_details,
@@ -1522,6 +1559,7 @@ class OptimizationScheduler:
             "next_run": None,
         }
         self._update_thread_optimization_loop = None
+        self._response_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._immediate_run_event = threading.Event()
         self._last_avg_runtime = 120  # Initialize with a default value
@@ -1539,10 +1577,9 @@ class OptimizationScheduler:
         return self.last_managed_loads
 
     def get_last_request_response(self):
-        """
-        Returns the last request response.
-        """
-        return self.last_request_response
+        """Return the latest published response without mutating the plan cache."""
+        with self._response_lock:
+            return self.last_request_response
 
     def get_current_state(self):
         """
@@ -1766,9 +1803,10 @@ class OptimizationScheduler:
         # solver placed. Attached here, after the request went out, because it is ours
         # alone: an EOS server validates what it is posted and would reject the key.
         optimized_response["managed_load_forecast"] = last_managed_forecast
-        self.last_request_response["response"] = json.dumps(
-            optimized_response, indent=4
-        )
+        # Optional final thermal state supplied with an external load profile.
+        # It is diagnostic data only: never sent to an external optimizer and
+        # never used for a control decision. Publication happens after adoption
+        # and the plan-version check below.
         self.last_managed_loads = json.dumps(
             {
                 "timestamp": json_optimize_input["timestamp"],
@@ -1780,10 +1818,6 @@ class OptimizationScheduler:
         )
         self.__set_state_response()
 
-        with open(
-            base_path + "/json/optimize_response.json", "w", encoding="utf-8"
-        ) as file:
-            json.dump(optimized_response, file, indent=4)
         # +++++++++
         (
             ac_charge_demand,
@@ -1803,6 +1837,21 @@ class OptimizationScheduler:
                 optimized_response.get("managed_loads") or {},
                 cost=optimized_response.get("managed_loads_cost"),
             )
+        load_manager.update_thermal_plans(
+            optimized_response.get("managed_loads") or {}, response_anchor
+        )
+        optimized_response["thermal_forecast"] = load_manager.thermal_forecasts()
+        with self._response_lock:
+            self.last_request_response["response"] = json.dumps(
+                optimized_response, indent=4
+            )
+        with open(
+            base_path + "/json/optimize_response.json", "w", encoding="utf-8"
+        ) as file:
+            json.dump(optimized_response, file, indent=4)
+        _refresh_external_thermal_plan(
+            optimized_response.get("managed_loads") or {}, response_anchor
+        )
 
         if error is not True:
             setting_control_data(ac_charge_demand, dc_charge_demand, discharge_allowed)
@@ -2070,6 +2119,9 @@ with BOOT.step("scheduler"):
     # shorter than the optimizer's cadence had the fallback planner publishing into
     # the household forecast on top of a solver that was merely about to run.
     load_manager.scheduler_interval = optimization_scheduler.update_interval
+    load_manager.on_contingent_push = (
+        lambda _load_id: optimization_scheduler.request_immediate_run()
+    )
 
 
 def change_control_state():
@@ -2359,12 +2411,24 @@ def get_optimize_request():
 @app.route("/json/optimize_response.json", methods=["GET"])
 def get_optimize_response():
     """
-    Retrieves the last optimization response and returns it as a JSON response.
+    Retrieves the last optimization response, adding a matching asynchronous
+    thermal push for the next dashboard refresh without moving the energy plan.
     """
-    return Response(
-        optimization_scheduler.get_last_request_response()["response"],
-        content_type="application/json",
-    )
+    with optimization_scheduler._response_lock:
+        response_text = optimization_scheduler.last_request_response["response"]
+        try:
+            response = json.loads(response_text)
+            anchor = datetime.fromisoformat(response["anchor"])
+            load_manager.update_thermal_plans(
+                response.get("managed_loads") or {}, anchor
+            )
+            response["thermal_forecast"] = load_manager.thermal_forecasts()
+            response_text = json.dumps(response, indent=4)
+            optimization_scheduler.last_request_response["response"] = response_text
+        except (KeyError, TypeError, ValueError):
+            # Startup and legacy backends without a midnight anchor stay unchanged.
+            pass
+    return Response(response_text, content_type="application/json")
 
 
 @app.route("/json/managed_loads_request.json", methods=["GET"])

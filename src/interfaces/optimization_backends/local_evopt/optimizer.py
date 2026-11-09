@@ -268,6 +268,12 @@ class ManagedLoadConfig:
             "no limit".
         feasible: Per-slot mask - window, ambient temperature, season.
         max_power_w: Draw while running, which sets the per-slot ceiling.
+        deadline_slot: Last solver-relative slot this load may occupy. None means no
+            deadline. This is separate from ``feasible`` so both constraints survive
+            the midnight-to-now rotation.
+        contiguous: Require one uninterrupted operating window. The window uses the
+            supplied minimum duration and carries the full offered scenario energy;
+            it is not a compressor-rated-power or per-slot modulation request.
         min_runtime_slots: Shortest run the appliance may be started for. Above 1 this
             costs a binary per slot.
         urgent_wh: Energy that must be placed whatever it costs - frost protection.
@@ -287,6 +293,8 @@ class ManagedLoadConfig:
     value_eur_per_wh: float = 0.0
     feasible: Optional[List[bool]] = None
     max_power_w: float = 0.0
+    deadline_slot: Optional[int] = None
+    contiguous: bool = False
     min_runtime_slots: int = 1
     urgent_wh: float = 0.0
     start_cost_eur: float = 0.0
@@ -549,7 +557,7 @@ class Optimizer:
             self.variables['ml_start'][i] = (
                 [self._new_var(f"ml_start_{i}_{t}", cat='Binary')
                  for t in self.time_steps]
-                if load.start_cost_eur > 0 else None
+                if load.start_cost_eur > 0 or load.contiguous else None
             )
 
         # Managed loads: energy placed in each slot, and whether the appliance is
@@ -564,12 +572,17 @@ class Optimizer:
                 for t in self.time_steps
             ]
             feasible = load.feasible or [True] * self.T
+            allowed_by_deadline = [
+                load.deadline_slot is None or t <= load.deadline_slot
+                for t in self.time_steps
+            ]
             self.variables['ml'][i] = [
                 self._new_var(
                     f"ml_{i}_{t}",
                     lowBound=0,
                     upBound=per_slot[t] if (
-                        t < len(feasible) and feasible[t]
+                        (load.contiguous or (t < len(feasible) and feasible[t]))
+                        and allowed_by_deadline[t]
                     ) else 0.0,
                 )
                 for t in self.time_steps
@@ -578,7 +591,7 @@ class Optimizer:
             # run to enforce, or starts being priced. Without either, the appliance may
             # be placed in any slot and the switch carries nothing the continuous
             # variable does not already have.
-            if load.min_runtime_slots > 1 or load.start_cost_eur > 0:
+            if load.min_runtime_slots > 1 or load.start_cost_eur > 0 or load.contiguous:
                 self.variables['ml_on'][i] = [
                     self._new_var(f"ml_on_{i}_{t}", cat='Binary')
                     for t in self.time_steps
@@ -1025,8 +1038,10 @@ class Optimizer:
 
             for t in self.time_steps:
                 cap = load.max_power_w * self.time_series.dt[t] / 3600.0
+                # contiguous masks describe permitted *starts*. Their following
+                # slots must remain usable by the block this start creates.
                 allowed = t < len(feasible) and feasible[t]
-                if not allowed or cap <= 0:
+                if (not allowed and not load.contiguous) or cap <= 0:
                     self.problem += on[t] == 0
                     continue
                 # The switch *is* the draw, not merely a permission to draw. Binding it
@@ -1035,17 +1050,56 @@ class Optimizer:
                 # satisfied by a switch that is on while nothing runs, and the appliance
                 # gets scheduled in isolated slots anyway.
                 #
-                # So a load with a minimum run, or with starts priced, is modelled as
-                # on/off at its rated power, which is what a compressor does. The demand
-                # ceiling may then be met a slot short rather than exactly; that is the
-                # honest answer for something that cannot half-run.
-                self.problem += run[t] == cap * on[t]
+                # Only a real minimum run requires rated-power on/off operation.
+                # Start costs alone must not force partial energy to zero or full
+                # capacity: an external flexibility contingent can legitimately
+                # deliver 800 Wh in a 900 Wh slot. Keep the switch tied to the
+                # energy, while allowing that partial energy in this case.
+                if load.min_runtime_slots > 1 and not load.contiguous:
+                    self.problem += run[t] == cap * on[t]
+                else:
+                    self.problem += run[t] <= cap * on[t]
+                if load.contiguous:
+                    # A contiguous external offer describes a complete operating
+                    # window, not compressor-rated power in every slot. Its energy
+                    # may be a scenario delta, so averaging over the requested
+                    # duration is the only floor that neither invents energy nor
+                    # lets the solver hide an interrupted run behind on=1, ml=0.
+                    # Since total energy is capped at demand_wh, any run occupies
+                    # exactly min_runtime_slots and carries demand_wh in total.
+                    slot_floor_wh = (
+                        max(0.0, load.demand_wh) / max(1, load.min_runtime_slots)
+                    )
+                    self.problem += run[t] >= slot_floor_wh * on[t]
 
             self._add_commitment_constraints(load, on, feasible)
-            self._add_switching_constraints(
-                on, self.variables['ml_start'][i], int(load.min_runtime_slots),
-                already_running=load.already_running or load.committed_on_slots > 0,
-            )
+            if load.contiguous:
+                self._add_contiguous_load_constraint(
+                    on, self.variables['ml_start'][i], int(load.min_runtime_slots),
+                    feasible,
+                )
+            else:
+                self._add_switching_constraints(
+                    on, self.variables['ml_start'][i], int(load.min_runtime_slots),
+                    already_running=load.already_running or load.committed_on_slots > 0,
+                )
+
+    def _add_contiguous_load_constraint(self, on, starts, min_runtime_slots, feasible):
+        """One permitted start, then one uninterrupted block; never episodes."""
+        if starts is None:
+            return
+        self.problem += pulp.lpSum(starts) <= 1
+        for t in self.time_steps:
+            previous = on[t - 1] if t else 0
+            self.problem += starts[t] >= on[t] - previous
+            self.problem += on[t] <= pulp.lpSum(starts[:t + 1])
+            if t >= len(feasible) or not feasible[t]:
+                # Forecast extension can lengthen the solver beyond the managed
+                # load's original mask. Such slots cannot begin another run.
+                self.problem += starts[t] == 0
+            for step in range(min_runtime_slots):
+                if t + step < self.T:
+                    self.problem += on[t + step] >= starts[t]
 
     def _add_shared_budget_constraints(self):
         """

@@ -127,6 +127,42 @@ def test_minimum_runtime_falls_back_to_single_slots_when_impossible(caplog):
     assert any("contiguous" in r.getMessage() for r in caplog.records)
 
 
+def test_external_contiguous_window_is_one_complete_block():
+    """The fallback must honor the same twin-derived duration as the MILP."""
+    price = [0.0004] * 48
+    price[10:12] = [0.0001] * 2
+    plan = plan_contingent(
+        _demand(total_wh=800.0, contiguous=True),
+        _ctx(price=price),
+        PlanOptions(strategy=STRATEGY_CHEAPEST, min_runtime_slots=2),
+    )
+    assert _used(plan) == [10, 11]
+    assert sum(plan) == pytest.approx(800.0)
+
+
+def test_external_contiguous_start_can_continue_past_a_start_blocker():
+    feasible = [False] * 48
+    feasible[10] = True
+    plan = plan_contingent(
+        _demand(total_wh=800.0, feasible=feasible, contiguous=True),
+        _ctx(),
+        PlanOptions(min_runtime_slots=2),
+    )
+    assert _used(plan) == [10, 11]
+    assert sum(plan) == pytest.approx(800.0)
+
+
+def test_external_contiguous_window_is_never_shortened():
+    feasible = [False] * 48
+    feasible[10] = True
+    plan = plan_contingent(
+        _demand(total_wh=800.0, feasible=feasible, contiguous=True, deadline_slot=10),
+        _ctx(),
+        PlanOptions(min_runtime_slots=2),
+    )
+    assert not any(plan)
+
+
 def test_daily_cap_limits_released_slots_per_day():
     plan = plan_contingent(
         _demand(total_wh=18000.0),

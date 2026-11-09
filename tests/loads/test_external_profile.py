@@ -259,6 +259,147 @@ def test_it_contributes_nothing_until_something_is_pushed():
 
 # --- the lifecycle of a pushed forecast ----------------------------------------------
 
+def test_a_changed_sg3_plan_invalidates_the_previous_thermal_forecast():
+    clock = Clock()
+    manager = make_manager([
+        heating(),
+        {"id": "sg3_req", "type": "external_contingent", "enabled": True, "rated_power_w": 3600},
+    ], clock=clock, time_frame_base=900)
+    manager.push("heating", {
+        "values": [100.0] * 192,
+        "thermal": {
+            "start": "2026-01-15T06:00:00+01:00",
+            "resolution": "15min",
+            "series": {"buffer_c": [30.0] * 192},
+            "plan": {
+                "signature": "2026-01-15T00:00:00+01:00|10-12",
+                "contingent_id": "sg3_req",
+            },
+        },
+    })
+    assert "heating" in manager.thermal_forecasts()
+    manager.update_thermal_plans(
+        {"sg3_req": [0.0] * 10 + [400.0, 400.0] + [0.0] * 180},
+        datetime(2026, 1, 15, tzinfo=BERLIN),
+    )
+    assert "heating" in manager.thermal_forecasts()
+    manager.update_thermal_plans(
+        {"sg3_req": [0.0] * 20 + [400.0, 400.0] + [0.0] * 170},
+        datetime(2026, 1, 15, tzinfo=BERLIN),
+    )
+    assert "heating" not in manager.thermal_forecasts()
+
+
+def test_thermal_invalidation_tracks_only_its_contingent_and_actual_blocks():
+    manager = make_manager([
+        heating(),
+        heating(id="other"),
+        {"id": "sg3_req", "type": "external_contingent", "enabled": True},
+    ], time_frame_base=900)
+    for load_id, contingent_id in (("heating", "sg3_req"), ("other", "other_req")):
+        manager.push(load_id, {
+            "values": [100.0] * 192,
+            "thermal": {
+                "start": "2026-01-15T06:00:00+01:00",
+                "resolution": "15min",
+                "series": {"buffer_c": [30.0] * 192},
+                "plan": {
+                    "signature": "2026-01-15T00:00:00+01:00|10-14",
+                    "contingent_id": contingent_id,
+                },
+            },
+        })
+    anchor = datetime(2026, 1, 15, tzinfo=BERLIN)
+    unchanged = [0.0] * 10 + [400.0] * 4 + [0.0] * 178
+    # A new manager must learn the current plan before it can call it unchanged.
+    assert manager.update_thermal_plans({"sg3_req": unchanged}, anchor) == ["sg3_req"]
+    assert manager.update_thermal_plans({"sg3_req": unchanged}, anchor) == []
+    assert set(manager.thermal_forecasts()) == {"heating", "other"}
+
+    split = [0.0] * 10 + [400.0, 0.0] + [400.0] * 3 + [0.0] * 177
+    assert manager.update_thermal_plans({"sg3_req": split}, anchor) == ["sg3_req"]
+    assert set(manager.thermal_forecasts()) == {"other"}
+
+    assert manager.update_thermal_plans({"sg3_req": [0.0] * 192}, anchor) == ["sg3_req"]
+    assert set(manager.thermal_forecasts()) == {"other"}
+
+
+def test_missing_current_thermal_still_requests_a_refresh_for_a_known_plan():
+    """An invalidated sidecar must not turn the changed plan into 'already handled'."""
+    manager = make_manager([
+        heating(),
+        {"id": "sg3_req", "type": "external_contingent", "enabled": True},
+    ], time_frame_base=900)
+    manager.push("heating", {
+        "values": [100.0] * 192,
+        "thermal": {
+            "start": "2026-01-15T06:00:00+01:00",
+            "resolution": "15min",
+            "series": {"buffer_c": [30.0] * 192},
+            "plan": {
+                "signature": "2026-01-15T00:00:00+01:00|10-12",
+                "contingent_id": "sg3_req",
+            },
+        },
+    })
+    plan = [0.0] * 10 + [400.0, 400.0] + [0.0] * 180
+    anchor = datetime(2026, 1, 15, tzinfo=BERLIN)
+    assert manager.update_thermal_plans({"sg3_req": plan}, anchor) == ["sg3_req"]
+    assert manager.update_thermal_plans({"sg3_req": plan}, anchor) == []
+    manager.update_thermal_plans(
+        {"sg3_req": [0.0] * 20 + [400.0, 400.0] + [0.0] * 170}, anchor
+    )
+    assert "heating" not in manager.thermal_forecasts()
+    assert manager.update_thermal_plans({"sg3_req": plan}, anchor) == ["sg3_req"]
+
+
+def test_a_new_contingent_push_is_provisional_until_the_optimizer_adopts_it():
+    manager = make_manager([
+        {"id": "sg3_req", "type": "external_contingent", "enabled": True},
+    ], time_frame_base=900)
+    manager.external_scheduler = True
+    requested = []
+    manager.on_contingent_push = requested.append
+    manager.push("sg3_req", {
+        "total_wh": 1800.0,
+        "max_power_w": 3600.0,
+        "min_runtime_slots": 2,
+        "contiguous": True,
+        "value_eur_per_kwh": 100.0,
+    })
+    assert requested == ["sg3_req"]
+    assert manager.instance("sg3_req").status()["fallback_active"] is True
+    assert manager.update_thermal_plans(
+        {"sg3_req": manager.instance("sg3_req").last_plan},
+        datetime(2026, 1, 15, tzinfo=BERLIN),
+    ) == ["sg3_req"]
+    manager.push("sg3_req", {"total_wh": 0.0, "deadline_hours": 1.0})
+    assert requested == ["sg3_req"], "a withdrawal must not trigger another optimization"
+
+
+def test_thermal_forecast_is_valid_only_with_its_profile():
+    clock = Clock()
+    manager = make_manager([heating()], clock=clock)
+    manager.push("heating", {
+        "values": [100.0] * 24,
+        "ttl_minutes": 30,
+        "thermal": {
+            "start": "2026-01-15T06:00:00+01:00",
+            "resolution": "hourly",
+            "series": {"buffer_c": [30.0, 40.0], "mode": ["idle", "heat"]},
+        },
+    })
+    assert manager.thermal_forecasts()["heating"]["series"]["buffer_c"][6] == 30.0
+    # The complete second source slot remains visible for the diagnostic horizon.
+    assert manager.thermal_forecasts()["heating"]["series"]["buffer_c"][7] == 40.0
+    clock.advance(minutes=31)
+    assert "heating" in manager.thermal_forecasts()
+    clock.advance(hours=48)
+    assert "heating" not in manager.thermal_forecasts()
+    manager.clear_push("heating")
+    assert manager.thermal_forecasts() == {}
+
+
 def test_the_newest_push_replaces_the_previous_one():
     """A re-pushed forecast supersedes; it is not added to what was there."""
     manager = make_manager([heating()])

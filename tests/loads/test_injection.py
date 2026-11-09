@@ -54,6 +54,103 @@ def test_constant_average_is_split_across_quarter_hour_slots():
     assert sum(result.slots_wh) == pytest.approx(48 * 1500)
 
 
+def test_thermal_sidecar_is_intensive_and_keeps_uncovered_slots_empty():
+    result = _push(
+        {
+            "values": [100.0] * 24,
+            "thermal": {
+                "start": "2026-06-01T10:00:00+02:00",
+                "resolution": "15min",
+                "series": {
+                    "buffer_c": [30.0, 40.0, 50.0],
+                    "mode": ["idle", "heat", "heat"],
+                },
+            },
+        }
+    )
+    assert result.thermal["start"] == "2026-06-01T10:00:00+02:00"
+    assert result.thermal["series"]["buffer_c"][10] == pytest.approx(40.0)
+    assert result.thermal["series"]["buffer_c"][11] is None
+    assert result.thermal["series"]["buffer_c"][12] is None
+    assert result.thermal["series"]["mode"][10] == "heat"
+    assert result.thermal["series"]["mode"][11] is None
+
+
+def test_thermal_sidecar_keeps_a_partial_operating_slot_when_aggregated():
+    result = _push(
+        {
+            "values": [100.0] * 24,
+            "thermal": {
+                "start": "2026-06-01T10:00:00+02:00",
+                "resolution": "15min",
+                "series": {
+                    "buffer_c": [30.0, 40.0, 50.0],
+                    "mode": ["idle", "idle", "heat"],
+                },
+                "run_probability": [0.0, 0.0, 0.2],
+            },
+        }
+    )
+    assert result.thermal["series"]["mode"][10] == "heat"
+    assert result.thermal["run_probability"][10] == pytest.approx(0.0667)
+    assert result.thermal["run_probability"][11] is None
+    assert result.thermal["run_probability"][12] is None
+
+
+def test_thermal_probability_is_aligned_with_temperature_and_excludes_standby():
+    result = _push(
+        {
+            "values": [100.0] * 24,
+            "thermal": {
+                "start": "2026-06-01T10:00:00+02:00",
+                "resolution": "15min",
+                "series": {
+                    "buffer_c": [30.0, 40.0, 50.0],
+                    "mode": ["idle", "idle", "heat"],
+                },
+                "run_probability": [0.0, 0.0, 0.2],
+                "running_threshold_w": 200.0,
+            },
+        }
+    )
+    # Probability shares the temperatures' frame_start, not the electrical 'now'.
+    assert result.thermal["run_probability"][10] == pytest.approx(0.0667)
+    assert result.thermal["run_probability"][11] is None
+    assert result.thermal["run_probability"][12] is None
+    assert result.thermal["running_threshold_w"] == 200.0
+
+    hourly = _push({
+        "values": [100.0] * 24,
+        "thermal": {
+            "start": "2026-06-01T11:00:00+02:00",
+            "resolution": "hourly",
+            "series": {"buffer_c": [40.0], "mode": ["heat"]},
+            "run_probability": [0.25],
+        },
+    }, slot_count=192, base=900)
+    assert hourly.thermal["run_probability"][44:48] == [0.25] * 4
+    assert hourly.thermal["run_probability"][48] is None
+
+    pause = _push({
+        "values": [100.0] * 24,
+        "thermal": {
+            "start": "2026-06-01T10:00:00+02:00",
+            "resolution": "15min",
+            "series": {"buffer_c": [40.0], "mode": ["pause"]},
+        },
+    })
+    assert pause.thermal["series"]["mode"][10] == "pause"
+
+
+def test_thermal_sidecar_rejects_non_finite_or_implausible_temperatures():
+    payload = {
+        "values": [100.0] * 24,
+        "thermal": {"start": "today", "resolution": "hourly", "series": {"buffer_c": [200.0]}},
+    }
+    with pytest.raises(InjectionError, match="-50..130"):
+        _push(payload)
+
+
 def test_twentyfour_hourly_values_fill_the_first_day():
     """The 0,0,0,0,1.2,1.4,... form from the issue - day two is left alone."""
     values = [0, 0, 0, 0, 1200, 1400, 1500, 1600] + [0] * 16
@@ -80,7 +177,31 @@ def test_energy_contingent_form():
     result = _push({"total_wh": 8000, "deadline_hours": 24})
     assert isinstance(result, PushedContingent)
     assert result.total_wh == 8000.0
-    assert result.deadline_slot == 34  # current_slot 10 + 24 hourly slots
+    assert result.deadline_slot == 33  # slot 33 ends at midnight, slot 34 exceeds it
+
+
+def test_deadline_keeps_a_slot_that_ends_exactly_at_the_deadline():
+    result = _push(
+        {"total_wh": 3200, "deadline_hours": 2.75},
+        slot_count=192, base=900, current_slot=42,
+    )
+    assert result.deadline_slot == 52
+
+
+def test_absolute_deadline_uses_the_same_midnight_anchor_as_the_plan():
+    result = _push(
+        {"total_wh": 3200, "deadline": "2026-06-01T13:00:00+02:00"},
+        slot_count=192, base=900, current_slot=42,
+    )
+    assert result.deadline_slot == 51
+
+
+def test_deadline_and_deadline_hours_are_mutually_exclusive():
+    with pytest.raises(InjectionError, match="either"):
+        _push({
+            "total_wh": 3200, "deadline_hours": 2.5,
+            "deadline": "2026-06-01T13:00:00+02:00",
+        })
 
 
 def test_contingent_deadline_is_capped_at_the_horizon():
