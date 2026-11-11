@@ -1409,6 +1409,48 @@ class TestManagedLoads:
         )
         assert all(value < 1.0 for value in result["managed_loads"]["pool"][:8])
 
+    def test_contiguous_start_filter_does_not_mutate_later_candidates(self, backend_hourly):
+        mask = [False, False] + [True] * 10 + [False] * 12
+        record = {
+            "id": "sg3_req", "demand_wh": 3200, "max_power_w": 3600,
+            "feasible": mask, "min_runtime_slots": 8, "contiguous": True,
+            "deadline_slot": 11,
+        }
+        with patch(
+            "src.interfaces.optimization_backends.optimization_backend_evopt.datetime",
+            _midnight_mock(),
+        ):
+            config = backend_hourly._managed_load_configs([record])[0]
+        assert [i for i, allowed in enumerate(config.feasible) if allowed] == [2, 3, 4]
+
+    def test_contiguous_start_filter_rejects_a_short_opening(self, backend_hourly):
+        mask = [False] * 8 + [True, True] + [False] * 14
+        record = {
+            "id": "sg3_req", "demand_wh": 2000, "max_power_w": 1500,
+            "feasible": mask, "min_runtime_slots": 3, "contiguous": True,
+            "deadline_slot": 9,
+        }
+        with patch(
+            "src.interfaces.optimization_backends.optimization_backend_evopt.datetime",
+            _midnight_mock(),
+        ):
+            config = backend_hourly._managed_load_configs([record])[0]
+        assert not any(config.feasible)
+
+    def test_contiguous_start_may_run_past_the_next_start_blocker(self, backend_hourly):
+        mask = [False, True, False, False, False, False] + [False] * 18
+        record = {
+            "id": "sg3_req", "demand_wh": 3200, "max_power_w": 3600,
+            "feasible": mask, "min_runtime_slots": 4, "contiguous": True,
+            "deadline_slot": 4,
+        }
+        with patch(
+            "src.interfaces.optimization_backends.optimization_backend_evopt.datetime",
+            _midnight_mock(),
+        ):
+            config = backend_hourly._managed_load_configs([record])[0]
+        assert config.feasible[1] is True
+
     def test_no_managed_loads_leaves_the_response_shape_alone(self, backend_hourly):
         result, _ = self._solve(backend_hourly, _make_eos_request(n_slots=48), None)
         assert result["managed_loads"] == {}

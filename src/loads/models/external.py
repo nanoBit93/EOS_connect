@@ -18,6 +18,7 @@ it:
 """
 
 import logging
+from datetime import datetime
 
 from ..contribution import align_series
 from ..injection import PushedContingent, PushedProfile
@@ -66,7 +67,7 @@ class ExternalPushModel(BaseDemandModel):
         logger.debug("[LOADS] '%s' accepted a %s push", self.id, self.kind)
 
     def clear(self):
-        """Drop the stored push - the DELETE endpoint and a failed re-push both use it."""
+        """Drop the stored push - the DELETE endpoint and clearing flows use it."""
         self._push = None
         self._anchor = None
 
@@ -101,14 +102,36 @@ class ExternalPushModel(BaseDemandModel):
             )
 
         push: PushedContingent = self._push
+        feasible = (
+            align_series(
+                push.feasible, self._anchor, ctx.anchor,
+                ctx.time_frame_base, ctx.slot_count,
+            )
+            if push.feasible is not None else [True] * ctx.slot_count
+        )
+        deadline_slot = push.deadline_slot
+        if deadline_slot is not None and self._anchor is not None:
+            deadline_slot -= int(round(
+                (ctx.anchor - self._anchor).total_seconds() / ctx.time_frame_base
+            ))
+        detail = {"active": push.total_wh > 0}
+        if push.value_eur_per_wh is not None:
+            detail["value_eur_per_kwh"] = push.value_eur_per_wh * 1000.0
         return EnergyDemand(
             kind=KIND_CONTINGENT,
             total_wh=push.total_wh,
-            feasible=[True] * ctx.slot_count,
-            max_power_w=float(self.config.get("rated_power_w", 0) or 0),
-            deadline_slot=push.deadline_slot,
+            feasible=feasible,
+            max_power_w=(
+                push.max_power_w
+                if push.max_power_w is not None
+                else float(self.config.get("rated_power_w", 0) or 0)
+            ),
+            deadline_slot=deadline_slot,
+            min_runtime_slots=push.min_runtime_slots,
+            contiguous=push.contiguous,
+            value_eur_per_wh=push.value_eur_per_wh,
             reason=REASON_PUSHED,
-            detail={"active": push.total_wh > 0},
+            detail=detail,
         )
 
     def _nothing(self, ctx, reason):
@@ -132,3 +155,18 @@ class ExternalPushModel(BaseDemandModel):
             "anchor": self._anchor.isoformat() if self._anchor else None,
             "time_frame_base": self._time_frame_base,
         }
+
+    def thermal_forecast(self, now):
+        """Current simulated temperatures, never an expired electrical profile."""
+        push = self._push
+        if not isinstance(push, PushedProfile) or push.thermal is None:
+            return None
+        thermal_valid_until = datetime.fromisoformat(push.thermal["valid_until"])
+        if now >= thermal_valid_until or not any(
+            any(value is not None for value in values)
+            for values in push.thermal.get("series", {}).values()
+        ):
+            return None
+        if push.thermal.get("stale_plan"):
+            return None
+        return push.thermal

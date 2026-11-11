@@ -112,6 +112,72 @@ body {
     }
 }
 
+/* Optional external thermal forecast, below the existing energy chart. */
+.left-box {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+
+.left-box > .header {
+    flex: 0 0 auto;
+}
+
+.optimization-content {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+}
+
+.optimization-content .energy-chart-wrap {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 220px;
+}
+
+.thermal-chart-panel {
+    flex: 0 0 auto;
+    margin-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.12);
+    padding-top: 6px;
+}
+
+.thermal-chart-title {
+    color: #bdbdbd;
+    font-size: 0.85em;
+    margin-bottom: 4px;
+}
+
+.thermal-chart-title i {
+    color: #4a9eff;
+    margin-right: 6px;
+}
+
+#thermal_chart_status {
+    color: #888;
+    margin-left: 8px;
+    font-size: 0.85em;
+}
+
+.thermal-chart-wrap {
+    position: relative;
+    height: 230px;
+    min-height: 180px;
+}
+
+#thermalChart {
+    width: 100% !important;
+    height: 100% !important;
+    display: block;
+}
+
+@media (max-width: 768px) {
+    .optimization-content .energy-chart-wrap { min-height: 230px; }
+    .thermal-chart-wrap { height: 210px; }
+}
+
 /* Very small screens (e.g. iPhone SE) */
 @media (max-width: 400px) {
     .battery-sessions-list {
