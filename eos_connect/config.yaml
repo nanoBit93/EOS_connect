@@ -1,6 +1,6 @@
 name: "EOS connect"
 description: "Advanced energy management system with built-in MILP optimizer, multi-source price integration, and real-time battery control. Configure via web UI with automatic Home Assistant integration."
-version: "0.3.4"
+version: "0.3.5"
 slug: "eos_connect_nanobit"
 url: "https://github.com/nanoBit93/EOS_connect"
 arch:
