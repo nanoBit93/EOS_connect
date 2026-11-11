@@ -94,13 +94,20 @@ class EnergyDemand:
         kind: ``contingent`` or ``profile``.
         total_wh: Contingent only. Electrical energy still needed over the horizon.
         profile_wh: Profile only. Per-slot electrical energy, already placed.
-        feasible: Per-slot mask. False where the load must not run - outside its
-            allowed window, below its minimum ambient temperature, out of season, or
-            past its daily runtime cap.
+        feasible: Per-slot mask. Ordinary loads: False where the load must not run -
+            outside its allowed window, below its minimum ambient temperature, out of season, or
+            past its daily runtime cap. For an external ``contiguous`` offer it instead marks
+            permitted starts; the MILP keeps the resulting full block running through the
+            following slots up to its deadline.
         max_power_w: Electrical power draw while running. Bounds how much energy the
             planner may put into a single slot.
         deadline_slot: Contingent only. Last slot the energy may occupy, or None for
             "anywhere in the horizon".
+        min_runtime_slots: Optional minimum contiguous runtime supplied by a digital
+            twin or external planner. It does not replace the user's configured limit.
+        contiguous: If true, the optimizer must place one uninterrupted block.
+        value_eur_per_wh: Optional gross avoided cost per additional Wh. This is not
+            the net saving after electricity costs - those belong to the optimizer.
         urgent: Skip price optimization and run as soon as feasible. Frost protection
             and a missed deadline both set this - being cheap is worthless if the pool
             freezes.
@@ -119,6 +126,9 @@ class EnergyDemand:
     slot_reasons: list = field(default_factory=list)
     max_power_w: float = 0.0
     deadline_slot: object = None
+    min_runtime_slots: int | None = None
+    contiguous: bool = False
+    value_eur_per_wh: float | None = None
     urgent: bool = False
     reason: str = ""
     detail: dict = field(default_factory=dict)

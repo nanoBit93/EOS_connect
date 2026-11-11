@@ -33,11 +33,17 @@ let localization = {
     "currency_minor_unit": "ct*"
 }
 
-// Set up chart resize handler
+// Set up chart resize handler. Chart.js has its own resize observer; align only
+// after that observer has committed both charts' new dimensions.
+let thermalAlignmentFrame = null;
 window.addEventListener('resize', () => {
-    if (chartManager) {
-        chartManager.updateLegendVisibility();
-    }
+    if (thermalAlignmentFrame !== null) cancelAnimationFrame(thermalAlignmentFrame);
+    thermalAlignmentFrame = requestAnimationFrame(() => {
+        thermalAlignmentFrame = null;
+        if (chartManager) {
+            chartManager.updateLegendVisibility();
+        }
+    });
 });
 
 function parseAlertMeta(rawMessage) {

@@ -228,6 +228,7 @@ class ManagedLoadManager:
         # Set when the optimizer can place contingent loads itself, which changes what
         # this module does with them: it computes the demand and defers the placing.
         self.external_scheduler = False
+        self.on_contingent_push = None
         self._last_ctx = None
         self._last_ctx_for = {}
         # Per-hour forecast-versus-sensor offset, one learner per instance.
@@ -240,6 +241,7 @@ class ManagedLoadManager:
         # Recent store temperatures, so the card can draw where the water has been as
         # well as where the plan takes it: id -> deque of (when, celsius).
         self._medium_history = {}
+        self._thermal_plan_versions = {}
         self._stop = threading.Event()
         self._thread = None
 
@@ -327,7 +329,7 @@ class ManagedLoadManager:
 
     # -- the optimizer-facing call ---------------------------------------------------------
 
-    def apply(self, gesamtlast, time_frame_base=None):
+    def apply(self, gesamtlast, time_frame_base=None, per_load=False):
         """
         Add every active contribution to a household load profile.
 
@@ -339,23 +341,30 @@ class ManagedLoadManager:
         The input list is never modified - both series here are backed by a cache on the
         interface that produced them, and mutating one in place is a bug this codebase
         has already paid for once (see the comment in `get_ems_data`).
+
+        With *per_load*, returns ``(combined, {id: [Wh]})``: what went in, kept apart, so
+        the chart can draw each appliance as its own band and take exactly that much back
+        out of the Load bar. Split here rather than fetched again by the caller because a
+        second read happens a poll cycle later and need not agree with this one.
         """
         base = list(gesamtlast or [])
         if not base or not self._instances:
-            return base
+            return (base, {}) if per_load else base
 
         resolution = int(time_frame_base or self.time_frame_base)
         anchor, now, _ = self._clock()
         extra = self.registry.total(anchor, len(base), resolution, now=now)
         if not any(extra):
-            return base
+            return (base, {}) if per_load else base
 
         combined = [max(0.0, value + bonus) for value, bonus in zip(base, extra)]
         logger.debug(
             "[LOADS] added %.0f Wh across %d slots to the load forecast",
             sum(combined) - sum(base), len(base),
         )
-        return combined
+        if not per_load:
+            return combined
+        return combined, self.registry.per_id(anchor, len(base), resolution, now=now)
 
     def contribution_total_wh(self):
         """Summed contribution over the horizon, for MQTT and the dashboard."""
@@ -410,6 +419,7 @@ class ManagedLoadManager:
                 # optimizer kept planning around an appliance the user had disabled.
                 self.registry.drop(item.id)
                 self.registry.drop(standby_contribution_id(item.id))
+                self.invalidate_thermal_for_contingent(item.id)
                 continue
             ctx = self._context_for(item, ctx_base)
             self._last_ctx_for[item.id] = ctx
@@ -418,24 +428,22 @@ class ManagedLoadManager:
                 self._hint_pv_counter(item)
             self._record_sample(item, ctx)
             defer = self.external_scheduler and item.kind_is_contingent()
-            if defer:
-                if item.waiting_for_schedule_since is None:
-                    item.waiting_for_schedule_since = ctx_base.now
-                if item.schedule_is_stale(ctx_base.now, self._schedule_max_age()):
-                    defer = False
-                    item.fallback_active = True
-                    logger.warning(
-                        "[LOADS] '%s' has had no schedule from the optimizer for over "
-                        "%d s - deciding from its own plan until one arrives",
-                        item.id, self._schedule_max_age(),
-                    )
-                else:
-                    item.fallback_active = False
-            else:
+            if not defer:
                 item.fallback_active = False
+                item.offered_at = None
             contribution, release = item.evaluate(
                 ctx, budget_wh=budget, defer_gate=defer
             )
+            if defer:
+                defer, replan = self._settle_handover(item, ctx_base)
+                if replan:
+                    # The gate was left for the optimizer and the optimizer is not
+                    # answering. Rare path, and the models' demand() is a pure function
+                    # of the context, so planning again is cheaper than predicting the
+                    # demand before the first pass.
+                    contribution, release = item.evaluate(
+                        ctx, budget_wh=budget, defer_gate=False
+                    )
             if defer:
                 # Its energy reaches the optimizer as something to place, not as part
                 # of the household profile. Registering it here as well would have the
@@ -453,6 +461,55 @@ class ManagedLoadManager:
         return self.stats.cycles
 
     # -- handing the placing to something that can do it better -----------------------------
+
+    def _settle_handover(self, item, ctx_base):
+        """
+        Who owns this load's placement for the rest of the cycle.
+
+        Called after ``evaluate``, so it judges the demand just computed rather than
+        last cycle's: only a load that is being offered to the optimizer can be
+        waiting on one. Returns ``(defer, replan)`` - whether the optimizer keeps the
+        placement, and whether the load has to be planned again with its gate settled
+        because it does not.
+
+        The two flags are this handover's record, and `schedulable` reads them: it
+        takes a fallback placement back out of the registry only where
+        ``fallback_active`` says there is one.
+        """
+        if not item.offers_demand():
+            # Nothing to place, so nothing is being waited for - this used to warn
+            # every cycle for a dishwasher that simply was not loaded. `evaluate`
+            # settled the gate itself. The clock starts again when demand comes back:
+            # keeping the old schedule time as well declared a load scheduled
+            # yesterday stale on its first cycle this morning.
+            item.waiting_for_schedule_since = None
+            item.last_schedule_at = None
+            # Neither offered nor falling back. Both flags are cleared by whoever ends
+            # the handover, and for an idle load that is nobody else: `schedulable`
+            # filters it out before the line that clears them, so they would stay up
+            # on the card for good - reading as a failing optimizer rather than as no
+            # work to do.
+            item.fallback_active = False
+            item.offered_at = None
+            return False, False
+
+        if item.waiting_for_schedule_since is None:
+            item.waiting_for_schedule_since = ctx_base.now
+        if not item.schedule_is_stale(ctx_base.now, self._schedule_max_age()):
+            item.fallback_active = False
+            return True, False
+
+        logger.warning(
+            "[LOADS] '%s' has had no schedule from the optimizer for "
+            "over %d s - deciding from its own plan until one arrives",
+            item.id, self._schedule_max_age(),
+        )
+        # This cycle puts the placement into the household forecast, so `schedulable`
+        # has to take it back out when it next offers the load, and an answer landing
+        # late must not read as "the offer worked".
+        item.fallback_active = True
+        item.offered_at = None
+        return False, True
 
     def _schedule_max_age(self):
         """
@@ -483,27 +540,32 @@ class ManagedLoadManager:
         """
         The contingent loads, as records for an optimizer that can place them itself.
 
-        A load the fallback has already taken over stops being offered: it is in the
-        household forecast until a schedule arrives, and offering it as well would
-        have the solver place the same energy the forecast already carries. Its
-        staleness was decided on the last cycle - read here, not recomputed, so this
-        answers what the module is actually doing rather than racing the poll thread.
-        (An idle-optimizer fallback still yields no records *and* no contributions,
-        because the fallback's own demand can be nothing to place.)
+        Two planners must never own one load at once: the fallback's placement is in
+        the household forecast, so offering the same load beside it would have the
+        solver place energy the profile already carries. This is where that is
+        decided, and deciding it *here* is the point - a solver asking for records is
+        a solver that is alive, so the load goes back to it in the same breath as its
+        contribution leaves the registry. Nothing can be placed twice, and the
+        handover is a decision per run rather than a latch: until this call the
+        fallback owned the load, after it the solver does, and an answer that never
+        comes puts the fallback back on the next cycle.
+
+        The drop has to reach the registry before the request is built, which is why
+        `__run_optimization_loop` asks for the records first and assembles the
+        household profile afterwards.
 
         Nothing in a record names an appliance: a sauna and a hot-water tank produce
         the same shape from the same code, because what the energy is *for* lives in
         the demand model that worked the numbers out.
         """
+        _, now, _ = self._clock()
         records = []
         for item in self.instances:
             if not item.enabled or not item.kind_is_contingent():
                 continue
-            if item.fallback_active:
+            if not item.offers_demand():
                 continue
             demand = item.last_demand
-            if demand is None or demand.total_wh <= 0 or demand.max_power_w <= 0:
-                continue
             ctx = self._last_ctx_for.get(item.id)
             slots = ctx.slot_count if ctx else len(demand.feasible or [])
             # Read from *now*, not from whenever the cycle last ran: how far into a run
@@ -517,7 +579,13 @@ class ManagedLoadManager:
                 "max_power_w": float(demand.max_power_w),
                 "value_eur_per_wh": self._value_of(item),
                 "feasible": _padded(demand.feasible, slots),
-                "min_runtime_slots": item.min_runtime_slots(ctx) if ctx else 1,
+                "deadline_slot": demand.deadline_slot,
+                "min_runtime_slots": (
+                    demand.min_runtime_slots
+                    if demand.min_runtime_slots is not None
+                    else (item.min_runtime_slots(ctx) if ctx else 1)
+                ),
+                "contiguous": demand.contiguous,
                 "urgent_wh": float(demand.total_wh) if demand.urgent else 0.0,
                 "committed_on_slots": committed_on,
                 "committed_off_slots": committed_off,
@@ -535,6 +603,14 @@ class ManagedLoadManager:
                     * demand.max_power_w * (ctx.hours_per_slot() if ctx else 1.0)
                 ),
             })
+            # Only now, with the record actually going out: a load dropped by one of
+            # the guards above was never offered and must keep whatever it had.
+            item.offered_at = now
+            if item.fallback_active:
+                # Handing it back - and taking the fallback's placement out of the
+                # household forecast, so this run's profile no longer carries it.
+                item.fallback_active = False
+                self.registry.drop(item.id)
         return records
 
     def adopt_schedules(self, schedules, cost=None):
@@ -543,7 +619,11 @@ class ManagedLoadManager:
 
         Loads the optimizer did not answer for keep the plan this module worked out on
         its own - a solver that failed, or was swapped out, must not leave a pool with
-        no way to decide anything.
+        no way to decide anything. A load that was *offered* and still came back
+        unanswered is the sharp case: `schedulable()` took its fallback placement out
+        of the household forecast on the way out, so if its last real schedule is by
+        now old enough to count as silence, the fallback has to be put back here and
+        not one poll cycle later.
 
         *cost* is what the household pays extra for them, measured by the optimizer
         against a run without them. It is the figure the price limit promises, so it is
@@ -562,18 +642,22 @@ class ManagedLoadManager:
         _, now, _ = self._clock()
 
         adopted = 0
+        unanswered = []
+        max_age = self._schedule_max_age()
         for item in self.instances:
             if not item.enabled or not item.kind_is_contingent():
                 continue
             schedule = schedules.get(item.id)
             if schedule is None:
+                if item.offered_at is not None:
+                    item.offered_at = None
+                    if item.schedule_is_stale(now, max_age):
+                        item.fallback_active = True
+                        unanswered.append(item.id)
                 continue
-            # Whatever the fallback was doing, the optimizer has spoken: from here the
-            # solver owns the placement again. Clearing the flag *before* adopting is
-            # what keeps schedulable() offering the load again on the run that follows
-            # - and it is what keeps the handover one-way in name only: a load that
-            # fell back is withheld from the solver, so its silence must never become
-            # permanent. An answer - even an empty one - flips it back.
+            # The optimizer has spoken, so the offer is settled and the solver owns
+            # the placement until it stops answering.
+            item.offered_at = None
             item.fallback_active = False
             ctx = self._last_ctx_for.get(item.id)
             if ctx is None:
@@ -588,6 +672,14 @@ class ManagedLoadManager:
                 # standby term has to follow, or a slot newly scheduled keeps carrying a
                 # standby Wh for it until the next poll.
                 self._publish_standby(item, ctx)
+        for entry_id in unanswered:
+            # Re-plans and publishes in one step, which is what puts the placement
+            # back into the household forecast the offer had just emptied.
+            logger.warning(
+                "[LOADS] '%s' was offered to the optimizer and came back unanswered "
+                "- deciding from its own plan until a schedule arrives", entry_id,
+            )
+            self.refresh(entry_id)
         return adopted
 
     def _at_now(self, ctx, now):
@@ -611,6 +703,8 @@ class ManagedLoadManager:
         finite, so an unreachable target still degrades to a short plan rather than to
         an unbounded objective.
         """
+        if item.last_demand is not None and item.last_demand.value_eur_per_wh is not None:
+            return float(item.last_demand.value_eur_per_wh)
         if item.max_price_eur_per_wh is not None:
             return float(item.max_price_eur_per_wh)
         prices = self._series(self.sources.price, self.horizon_hours) or [0.0]
@@ -645,6 +739,13 @@ class ManagedLoadManager:
                     self._consume_budget(budget, other.last_plan)
 
         ctx = self._context_for(item, ctx_base)
+        if self.external_scheduler and item.kind_is_contingent():
+            # refresh() runs before the optimizer has answered this new offer.
+            # Its local placement is provisional until adopt_schedules(); an external
+            # consumer must not mistake it for the final solver placement.
+            item.fallback_active = True
+            if item.waiting_for_schedule_since is None:
+                item.waiting_for_schedule_since = ctx_base.now
         contribution, release = item.evaluate(ctx, budget_wh=budget)
         self._store_result(item, contribution, release)
         self._publish_standby(item, ctx)
@@ -676,20 +777,23 @@ class ManagedLoadManager:
         than read as zero - the draw does not vanish because the compressor started.
 
         Nothing is published without a threshold: the feature is off, the meter is
-        part of the base load, and the draw is already counted there. The contribution
-        is dropped *before* it is built rather than replaced in one step only when the
-        new one exists - set() is atomic under the registry lock, and a reader on the
-        optimizer path must never see the household minus its standby because a cycle
-        happened to fall between the two writes.
+        part of the base load, and the draw is already counted there. Whether this
+        load has a standby term at all is `ManagedLoad.standby_forecast_active()` -
+        the same answer the status payload and the MQTT topic report, asked once so
+        the three cannot drift apart. The measured figure goes with it: the setting
+        is hot-reloadable, and a threshold taken back to zero must not leave the last
+        reading behind to be published forever.
+
+        The contribution is dropped *before* it is built rather than replaced in one
+        step only when the new one exists - set() is atomic under the registry lock,
+        and a reader on the optimizer path must never see the household minus its
+        standby because a cycle happened to fall between the two writes.
         """
-        if not item.enabled or not item.metered_out_of_base_load():
+        if not item.enabled or not item.standby_forecast_active():
             self.registry.drop(standby_contribution_id(item.id))
+            item.last_standby_w = None
             return
-        model = item.model
-        if model is None or not hasattr(model, "standby_power_now"):
-            self.registry.drop(standby_contribution_id(item.id))
-            return
-        measured = model.standby_power_now(ctx.readings or {})
+        measured = item.model.standby_power_now(ctx.readings or {})
         if measured is not None:
             item.last_standby_w = measured
         if not item.last_standby_w or item.last_standby_w <= 0:
@@ -1428,7 +1532,24 @@ class ManagedLoadManager:
         )
         item.accept_push(parsed, anchor, self.time_frame_base, source=source)
         logger.info("[LOADS] '%s' accepted a push via %s", entry_id, source)
+        if item.kind_is_contingent() and parsed.total_wh <= 0:
+            self.invalidate_thermal_for_contingent(entry_id)
         self.refresh(entry_id)
+        if (
+            item.kind_is_contingent()
+            and parsed.total_wh > 0
+            and self.on_contingent_push is not None
+        ):
+            # A new offer must reach the solver before the twin reads its placement.
+            # Waiting for the ordinary cadence would leave only the provisional
+            # fallback plan available for the thermal forecast. A zero-energy
+            # withdrawal is not a new offer and must not start another cycle.
+            try:
+                self.on_contingent_push(entry_id)
+            except Exception:  # pylint: disable=broad-except
+                logger.exception(
+                    "[LOADS] could not request an optimization after '%s'", entry_id
+                )
         return parsed
 
     def _pull_profile(self, item, ctx):
@@ -1507,6 +1628,7 @@ class ManagedLoadManager:
         cleared = item.clear_push()
         if cleared:
             self.registry.drop(entry_id)
+            self.invalidate_thermal_for_contingent(entry_id)
             self.refresh(entry_id)
         return cleared
 
@@ -1572,6 +1694,12 @@ class ManagedLoadManager:
     def _load_status(self, item):
         """One load's status, plus what the manager knows about its site."""
         status = item.status()
+        # Per load, because the subsystem-level flag says only that the optimizer *can*
+        # place loads. A profile load is never one of them, and describing it as
+        # scheduled hides the one true thing about it: it is in the load forecast.
+        status["scheduled_by_optimizer"] = bool(
+            self.external_scheduler and item.kind_is_contingent()
+        )
         bias = self.ambient_bias_state(item.id)
         if bias is not None:
             status["ambient_bias"] = bias
@@ -1582,6 +1710,88 @@ class ManagedLoadManager:
         if medium is not None:
             status["water_series"] = medium
         return status
+
+    def invalidate_thermal_for_contingent(self, contingent_id):
+        """Remove the final-state claim when its linked contingent disappears."""
+        for item in self.instances:
+            thermal = getattr(getattr(item.model, "_push", None), "thermal", None)
+            if not isinstance(thermal, dict):
+                continue
+            if (thermal.get("plan") or {}).get("contingent_id") == contingent_id:
+                thermal["stale_plan"] = True
+
+    def thermal_forecasts(self):
+        """Optional external thermal forecasts, valid for their diagnostic horizon."""
+        _, now, _ = self._clock()
+        forecasts = {}
+        for item in self.instances:
+            getter = getattr(item.model, "thermal_forecast", None)
+            if getter is None:
+                continue
+            forecast = getter(now)
+            if forecast is not None:
+                forecasts[item.id] = forecast
+        return forecasts
+
+    def _plan_signatures(self, schedules, anchor):
+        """Plan identities in the same midnight-anchored slot space the twin uses."""
+        signatures = {}
+        for load_id, slots in (schedules or {}).items():
+            if not isinstance(slots, list):
+                continue
+            occupied = [index for index, value in enumerate(slots) if value > 0]
+            intervals = []
+            for index in occupied:
+                if not intervals or index != intervals[-1][1]:
+                    intervals.append([index, index + 1])
+                else:
+                    intervals[-1][1] = index + 1
+            interval_text = ",".join(f"{lo}-{hi}" for lo, hi in intervals)
+            signature = (
+                f"{anchor.isoformat()}|{interval_text}"
+                if occupied else None
+            )
+            signatures[load_id] = (signature, intervals)
+        return signatures
+
+    def update_thermal_plans(self, schedules, anchor, commit=True):
+        """Match thermal simulations to the plan being published.
+
+        A sidecar names its contingent, so unrelated external profiles stay valid.
+        The complete occupied intervals distinguish split blocks with equal endpoints.
+        Returns the ids whose contingent placement changed; the caller can then ask
+        the external simulator for a replacement without replanning an unchanged run.
+        """
+        signatures = self._plan_signatures(schedules, anchor)
+        changed = [
+            load_id for load_id, (signature, _intervals) in signatures.items()
+            if self._thermal_plan_versions.get(load_id, (None, []))[0] != signature
+            or not any(
+                (getattr(getattr(other.model, "_push", None), "thermal", None) or {}).get(
+                    "plan", {}
+                ).get("contingent_id") == load_id
+                and not (
+                    getattr(getattr(other.model, "_push", None), "thermal", None) or {}
+                ).get("stale_plan", False)
+                for other in self.instances
+            )
+        ]
+        for load_id, (signature, _intervals) in signatures.items():
+            for other in self.instances:
+                thermal = getattr(getattr(other.model, "_push", None), "thermal", None)
+                if not isinstance(thermal, dict):
+                    continue
+                plan = thermal.get("plan") or {}
+                contingent_id = plan.get("contingent_id")
+                if contingent_id != load_id:
+                    continue
+                if plan.get("signature") == signature:
+                    thermal["stale_plan"] = False
+                else:
+                    thermal["stale_plan"] = True
+        if commit:
+            self._thermal_plan_versions = signatures
+        return changed
 
     def status(self):
         """The whole subsystem, for `GET /api/managed_loads` and the dashboard."""

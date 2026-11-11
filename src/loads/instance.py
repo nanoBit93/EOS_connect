@@ -54,6 +54,16 @@ def _as_ct_per_kwh(eur_per_wh):
         return None
     return round(eur_per_wh * 100.0 * 1000.0, 2)
 
+
+def _offerable(demand):
+    """Whether *demand* is something an optimizer can be asked to place."""
+    return (
+        demand is not None
+        and (demand.total_wh or 0) > 0
+        and (demand.max_power_w or 0) > 0
+    )
+
+
 # How long a contribution computed internally stays valid. Long enough to survive a
 # skipped cycle, short enough that a wedged poll thread stops inflating the forecast
 # instead of holding a stale demand there for a day.
@@ -110,10 +120,15 @@ class ManagedLoad:
         self.waiting_for_schedule_since = None
         # Whether the fallback planner currently owns the placement - i.e. the last
         # schedule is older than the manager's staleness age and this load has been
-        # handed back to this module's own plan. Set only by the manager's cycle, read
-        # there and by schedulable(); a schedule arriving clears it by way of
-        # last_schedule_at, never by direct write.
+        # handed back to this module's own plan. The cycle sets it when the schedule
+        # goes stale; `schedulable()` takes it back the moment a solver asks, because
+        # a solver that asks is a solver that is alive.
         self.fallback_active = False
+        # When this load was last handed to a solver as something to place. The answer
+        # to that offer settles whether the fallback stays gone or comes straight back,
+        # so the manager has to be able to tell "was never offered" from "offered and
+        # not answered for".
+        self.offered_at = None
         # Whether the reported price was measured against a run without this load, or
         # is only the tariff of the hours it occupies.
         self.last_cost_is_measured = False
@@ -121,6 +136,8 @@ class ManagedLoad:
         self.last_demand = None
         self.last_release = None
         self.last_error = None
+        self.plan_anchor = None
+        self.plan_time_frame_base = None
 
     def _price_cap(self, entry, key):
         """ct/kWh is what a user can reason about; the planner wants EUR/Wh."""
@@ -195,6 +212,16 @@ class ManagedLoad:
         if since is None:
             return False
         return (now - since).total_seconds() > max_age_seconds
+
+    def offers_demand(self):
+        """
+        Whether this load currently has anything for an optimizer to place.
+
+        Mirrors the filter in ``ManagedLoadManager.schedulable``: a load with no energy
+        to deliver is never sent to the optimizer, so no schedule will ever come back
+        for it - and waiting for one is not a fault.
+        """
+        return _offerable(self.last_demand)
 
     def kind_is_contingent(self):
         """Whether this load's timing is ours to choose, rather than merely reported."""
@@ -271,9 +298,19 @@ class ManagedLoad:
         """Turn the minute- and hour-based config into slot counts for this resolution."""
         return PlanOptions(
             strategy=self.config.get("strategy"),
-            min_runtime_slots=self.min_runtime_slots(ctx),
+            min_runtime_slots=(
+                self.last_demand.min_runtime_slots
+                if self.last_demand is not None
+                and self.last_demand.min_runtime_slots is not None
+                else self.min_runtime_slots(ctx)
+            ),
             max_slots_per_day=self.max_slots_per_day(ctx),
-            max_price_eur_per_wh=self.max_price_eur_per_wh,
+            max_price_eur_per_wh=(
+                self.last_demand.value_eur_per_wh
+                if self.last_demand is not None
+                and self.last_demand.value_eur_per_wh is not None
+                else self.max_price_eur_per_wh
+            ),
         )
 
     def reconfigure(self, entry):
@@ -327,7 +364,7 @@ class ManagedLoad:
         if demand.kind == KIND_PROFILE:
             plan = list(demand.profile_wh or [0.0] * ctx.slot_count)
             release = None
-        elif defer_gate:
+        elif defer_gate and _offerable(demand):
             # Somebody else is doing the placing. Plan anyway - it is what the load
             # falls back to if no schedule arrives - but do not touch the gate: it
             # remembers when it last released, so settling it against a plan that is
@@ -348,8 +385,15 @@ class ManagedLoad:
         # card, the API and the summary flipped between them for as long as the load
         # was scheduled. On a live pool that read as 21 slots and 8.4 kWh appearing and
         # vanishing every couple of minutes with the inputs unchanged.
-        if not (defer_gate and self.last_schedule_at is not None):
+        # A load with nothing to place is not handed to the optimizer, so it settles its
+        # own gate (above) and publishes its own, empty plan here. Keeping the deferred
+        # branch for it latched the gate on the optimizer's last answer - an appliance
+        # left released after its demand was gone, until the staleness fallback fired.
+        deferred = defer_gate and _offerable(demand)
+        if not (deferred and self.last_schedule_at is not None):
             self.last_plan = plan
+            self.plan_anchor = ctx.anchor
+            self.plan_time_frame_base = ctx.time_frame_base
         self.last_release = release
 
         if not any(plan):
@@ -372,6 +416,8 @@ class ManagedLoad:
         if len(plan) < ctx.slot_count:
             plan += [0.0] * (ctx.slot_count - len(plan))
         self.last_plan = plan[: ctx.slot_count]
+        self.plan_anchor = ctx.anchor
+        self.plan_time_frame_base = ctx.time_frame_base
         self.last_schedule_at = ctx.now
         # What the household actually pays extra, where the optimizer measured it. The
         # tariff of the occupied hours is the fallback, and only a rough guide: it
@@ -408,6 +454,8 @@ class ManagedLoad:
         planned_now = (
             0 <= ctx.current_slot < len(plan) and plan[ctx.current_slot] > 0
         )
+        if not active:
+            planned_now = False
         release = self.gate.evaluate(
             planned=planned_now,
             urgent=demand.urgent,
@@ -666,6 +714,8 @@ class ManagedLoad:
             "energy_needed_wh": round(demand.total_wh, 1) if demand else 0.0,
             "planned_wh": round(sum(self.last_plan), 1) if self.last_plan else 0.0,
             "plan": [round(value, 1) for value in self.last_plan],
+            "plan_anchor": self.plan_anchor.isoformat() if self.plan_anchor else None,
+            "time_frame_base": self.plan_time_frame_base,
             # Who placed this plan: the optimizer while its answers keep arriving, the
             # fallback once its silence has outlasted the staleness age. Read "who is
             # the planner", not a quality judgement.

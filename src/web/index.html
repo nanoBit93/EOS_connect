@@ -440,8 +440,17 @@
                     </span>
                     <span class="header_notification" id="timestamp_last_run">00:00:00</span>
                 </div>
-                <div class="content">
-                    <canvas id="energyChart"></canvas>
+                <div class="content optimization-content">
+                    <div class="energy-chart-wrap">
+                        <canvas id="energyChart"></canvas>
+                    </div>
+                    <div id="thermal_chart_panel" class="thermal-chart-panel" style="display: none;">
+                        <div class="thermal-chart-title"><i class="fa-solid fa-temperature-half"></i>
+                            Simulated temperatures (final forecast)
+                            <span id="thermal_chart_status"></span>
+                        </div>
+                        <div class="thermal-chart-wrap"><canvas id="thermalChart"></canvas></div>
+                    </div>
                 </div>
             </div>
             <div class="right-box">

@@ -135,6 +135,18 @@ def test_the_mask_is_obeyed():
     assert sum(energy) > 1000.0
 
 
+def test_the_deadline_is_obeyed_even_with_later_cheap_slots():
+    prices = [DEAR] * T
+    prices[2] = CHEAP
+    prices[20:] = [CHEAP / 2] * 4
+    opt = _optimizer([
+        _load(deadline_slot=5, feasible=[True] * T, value_eur_per_wh=DEAR * 2)
+    ], prices=prices)
+    energy = _placed(opt.solve())
+    assert sum(energy) > 1000.0
+    assert sum(energy[6:]) == pytest.approx(0.0, abs=1.0)
+
+
 def test_free_sun_is_used_before_the_grid():
     pv = [0.0] * T
     pv[12] = 5000.0
@@ -237,6 +249,138 @@ def test_no_minimum_run_means_no_binaries():
     opt = _optimizer([_load(min_runtime_slots=1)])
     opt.create_model()
     assert opt.variables["ml_on"][0] is None
+
+
+def test_start_costs_without_min_runtime_allow_partial_slot_energy():
+    """Start preference must not turn a flexible contingent into fixed-power demand."""
+    opt = _optimizer([
+        _load(min_runtime_slots=1, start_cost_eur=0.135, value_eur_per_wh=DEAR * 2)
+    ])
+    opt.create_model()
+    opt.problem += opt.variables["ml"][0][0] == 800.0
+    result = opt.solve()
+    assert result["status"] == "Optimal"
+    assert _placed(result)[0] == pytest.approx(800.0)
+
+
+def test_a_minimum_run_cannot_cross_the_deadline():
+    opt = _optimizer([
+        _load(min_runtime_slots=3, deadline_slot=5, value_eur_per_wh=DEAR * 2)
+    ])
+    result = opt.solve()
+    assert result["status"] == "Optimal"
+    assert sum(_placed(result)[6:]) == pytest.approx(0.0, abs=1.0)
+
+
+def test_contiguous_sg3_block_cannot_be_split_or_shortened():
+    prices = [DEAR] * T
+    prices[8] = CHEAP
+    prices[10] = CHEAP / 2
+    prices[12] = CHEAP
+    mask = [False] * 6 + [True] * 8 + [False] * 10
+    opt = _optimizer([
+        _load(
+            demand_wh=2000.0,
+            feasible=mask,
+            min_runtime_slots=3,
+            contiguous=True,
+            start_cost_eur=0.135,
+            value_eur_per_wh=DEAR * 2,
+        )
+    ], prices=prices)
+    result = opt.solve()
+    assert result["status"] == "Optimal"
+    energy = _placed(result)
+    positive = [i for i, value in enumerate(energy) if value > 1.0]
+    assert positive == list(range(positive[0], positive[-1] + 1))
+    assert len(positive) == 3
+    assert sum(energy) == pytest.approx(2000.0)
+    assert sum(opt.variables["ml_start"][0][t].value() for t in range(T)) == 1
+    assert all(
+        opt.variables["ml_on"][0][t].value() == 1
+        for t in positive
+    )
+    assert all(value > 1.0 for value in energy[positive[0]:positive[-1] + 1])
+
+
+def test_a_contiguous_window_longer_than_its_feasible_block_is_not_shortened():
+    """The backend filters this offer before the solver; no partial block is valid."""
+    mask = [False] * T
+    mask[8:10] = [True, True]
+    opt = _optimizer([
+        _load(
+            demand_wh=2000.0,
+            feasible=mask,
+            deadline_slot=9,
+            min_runtime_slots=3,
+            contiguous=True,
+            value_eur_per_wh=DEAR * 2,
+        )
+    ])
+    result = opt.solve()
+    assert result["status"] == "Optimal"
+    assert sum(_placed(result)) == pytest.approx(0.0, abs=1.0)
+
+
+def test_contiguous_demand_creates_on_variables_without_start_costs():
+    opt = _optimizer([
+        _load(min_runtime_slots=1, contiguous=True, start_cost_eur=0.0)
+    ])
+    opt.create_model()
+    assert opt.variables["ml_on"][0] is not None
+
+
+def test_contiguous_start_mask_does_not_block_the_following_run_slots():
+    """A start mask must not be reused as an energy mask for its own run."""
+    opt = _optimizer([
+        _load(
+            demand_wh=3200.0, max_power_w=3600.0,
+            feasible=[False, False] + [True] + [False] * (T - 3),
+            deadline_slot=9, min_runtime_slots=8, contiguous=True,
+            value_eur_per_wh=DEAR * 2,
+        )
+    ])
+    result = opt.solve()
+    assert result["status"] == "Optimal"
+    energy = _placed(result)
+    assert [i for i, value in enumerate(energy) if value > 1.0] == list(range(2, 10))
+    assert sum(energy) == pytest.approx(3200.0)
+
+
+def test_contiguous_mask_can_be_shorter_than_an_extended_solver_horizon():
+    """Morning-PV extension must not index beyond the external start mask."""
+    opt = _optimizer([
+        _load(
+            demand_wh=417.0, max_power_w=3015.0,
+            feasible=[True] * 12, deadline_slot=11,
+            min_runtime_slots=2, contiguous=True,
+            value_eur_per_wh=DEAR * 2,
+        )
+    ])
+    result = opt.solve()
+    assert result["status"] == "Optimal"
+    energy = _placed(result)
+    assert [i for i, value in enumerate(energy) if value > 1.0] == [0, 1]
+    assert sum(energy) == pytest.approx(417.0)
+
+
+def test_contiguous_run_can_end_exactly_at_its_deadline():
+    """The last permitted slot remains usable for the requested full duration."""
+    prices = [DEAR] * T
+    prices[2:10] = [CHEAP] * 8
+    opt = _optimizer([
+        _load(
+            demand_wh=3200.0, max_power_w=3600.0,
+            feasible=[True] * 10 + [False] * 14,
+            deadline_slot=9, min_runtime_slots=8, contiguous=True,
+            value_eur_per_wh=DEAR * 2,
+        )
+    ], prices=prices)
+    result = opt.solve()
+    assert result["status"] == "Optimal"
+    energy = _placed(result)
+    assert sum(energy) == pytest.approx(3200.0)
+    assert [i for i, value in enumerate(energy) if value > 1.0] == list(range(2, 10))
 
 
 # --- urgent -----------------------------------------------------------------------------

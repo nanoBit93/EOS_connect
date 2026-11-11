@@ -403,15 +403,47 @@ class LocalEVOptBackend(EVOptBackend):
                 continue
 
             mask = entry.get("feasible")
+            deadline_slot = entry.get("deadline_slot")
+            if deadline_slot is not None:
+                deadline_slot = (
+                    int(deadline_slot) - self._calculate_time_parameters()["current_slot"]
+                )
+            min_runtime_slots = max(1, int(entry.get("min_runtime_slots", 1) or 1))
+            feasible = self.to_solver_slots(mask, fill=False) if mask else None
+            if feasible is not None:
+                # Evaluate every candidate against the original mask. Updating the
+                # same list while scanning makes the last permitted start false;
+                # all earlier starts then lose their required following slots too.
+                # A contiguous external mask describes starts, not individual run
+                # slots: an already-started block continues through later blocked
+                # starts until its simulated target completion and deadline.
+                available = list(feasible)
+                contiguous = bool(entry.get("contiguous", False))
+                feasible = [
+                    allowed
+                    and allowed_by_deadline
+                    and self._start_fits_runtime(
+                        available,
+                        index,
+                        min_runtime_slots,
+                        deadline_slot,
+                        contiguous=contiguous,
+                    )
+                    for index, (allowed, allowed_by_deadline) in enumerate(zip(
+                        available,
+                        [deadline_slot is None or t <= deadline_slot for t in range(len(available))],
+                        strict=True,
+                    ))
+                ]
             configs.append(ManagedLoadConfig(
                 id=str(entry.get("id", "")),
                 demand_wh=demand,
                 value_eur_per_wh=float(entry.get("value_eur_per_wh", 0) or 0),
-                feasible=(
-                    self.to_solver_slots(mask, fill=False) if mask else None
-                ),
+                feasible=feasible,
                 max_power_w=power,
-                min_runtime_slots=max(1, int(entry.get("min_runtime_slots", 1) or 1)),
+                deadline_slot=deadline_slot,
+                contiguous=bool(entry.get("contiguous", False)),
+                min_runtime_slots=min_runtime_slots,
                 urgent_wh=float(entry.get("urgent_wh", 0) or 0),
                 start_cost_eur=float(entry.get("start_cost_eur", 0) or 0),
                 max_slots_per_day=max(0, int(entry.get("max_slots_per_day", 0) or 0)),
@@ -426,6 +458,27 @@ class LocalEVOptBackend(EVOptBackend):
                 len(configs), ", ".join(c.id for c in configs),
             )
         return configs
+
+    @staticmethod
+    def _start_fits_runtime(feasible, start, min_runtime_slots, deadline_slot, *, contiguous):
+        """Check that a permitted start can complete its full operation.
+
+        Ordinary managed loads require every occupied slot to be open. For a
+        contiguous external offer, ``feasible`` is a *start* mask: the thermal
+        model has already proved the complete operation, so only horizon and
+        deadline bound it. The MILP keeps the following block uninterrupted.
+        """
+        end = start + min_runtime_slots
+        if deadline_slot is not None and end - 1 > deadline_slot:
+            return False
+        return end <= len(feasible) and (contiguous or all(feasible[start:end]))
+
+    @staticmethod
+    def _minimum_run_fits(feasible, start, min_runtime_slots, deadline_slot):
+        """Backward-compatible ordinary-slot runtime check."""
+        return LocalEVOptBackend._start_fits_runtime(
+            feasible, start, min_runtime_slots, deadline_slot, contiguous=False
+        )
 
     def _managed_load_cost(self, optimizer, evopt_request, evopt_response, timeout):
         """

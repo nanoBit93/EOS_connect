@@ -7,6 +7,7 @@
 class ChartManager {
     constructor() {
         this.chartInstance = null;
+        this.thermalChartInstance = null;
         console.log('[ChartManager] Initialized');
     }
 
@@ -94,18 +95,55 @@ class ChartManager {
     }
 
     /**
-     * The scheduled managed loads, summed and aligned to the chart's x-axis.
+     * Two sets of managed-load schedules as one, summed per slot.
+     *
+     * The solver's placements and the forecast contributions are disjoint by design -
+     * a load is either something the solver is timing or a fixed part of the household
+     * profile, never both - but merging by key would silently drop one if that ever
+     * stopped being true, and the symptom would be a band that is quietly too short.
+     *
+     * @param {Object|undefined} a - {id: [Wh per slot]}
+     * @param {Object|undefined} b - {id: [Wh per slot]}
+     * @returns {Object} {id: [Wh per slot]}
+     */
+    static mergeSchedules(a, b) {
+        const merged = {};
+        for (const source of [a || {}, b || {}]) {
+            for (const [id, values] of Object.entries(source)) {
+                if (!Array.isArray(values)) {
+                    continue;
+                }
+                const existing = merged[id];
+                if (!existing) {
+                    merged[id] = values.slice();
+                    continue;
+                }
+                const width = Math.max(existing.length, values.length);
+                merged[id] = Array.from({ length: width }, (_, i) =>
+                    (Number(existing[i]) || 0) + (Number(values[i]) || 0)
+                );
+            }
+        }
+        return merged;
+    }
+
+    /**
+     * The managed loads, summed and aligned to the chart's x-axis, in Wh.
      *
      * One band rather than one per load: the total is what the Load bar was missing,
      * and the managed-loads overlay already breaks it down per appliance.
+     *
+     * Separate from `managedLoadSeries` because the same numbers are needed twice and
+     * in two forms - drawn as the band, and subtracted from the Load bar - and the one
+     * thing this feature cannot afford is two expressions of the same rotation.
      *
      * @param {Object|undefined} schedules - {id: [Wh per slot]} from the response
      * @param {number} slot - Current slot index
      * @param {number} length - Slots the chart is drawing
      * @param {number} timeFrameBase - 900 or 3600
-     * @returns {Array<string>} kWh per slot, or empty when nothing was scheduled
+     * @returns {Array<number>} Wh per slot, or empty when there is nothing to draw
      */
-    static managedLoadSeries(schedules, slot, length, timeFrameBase) {
+    static managedLoadTotals(schedules, slot, length, timeFrameBase) {
         const series = Object.values(schedules || {}).filter(Array.isArray);
         if (!series.length) {
             return [];
@@ -117,8 +155,185 @@ class ChartManager {
         if (!summed.some(value => value > 0)) {
             return [];
         }
-        return ChartManager.alignToAxis(summed, slot, length, timeFrameBase)
+        return ChartManager.alignToAxis(summed, slot, length, timeFrameBase);
+    }
+
+    /**
+     * `managedLoadTotals` as the kWh strings the dataset wants.
+     *
+     * @param {Object|undefined} schedules - {id: [Wh per slot]} from the response
+     * @param {number} slot - Current slot index
+     * @param {number} length - Slots the chart is drawing
+     * @param {number} timeFrameBase - 900 or 3600
+     * @returns {Array<string>} kWh per slot, or empty when nothing was scheduled
+     */
+    static managedLoadSeries(schedules, slot, length, timeFrameBase) {
+        return ChartManager
+            .managedLoadTotals(schedules, slot, length, timeFrameBase)
             .map(value => (value / 1000).toFixed(3));
+    }
+
+    /**
+     * Align the actual plot areas, not just the canvas borders.
+     *
+     * The energy chart has two right-hand axes; the temperature chart has one.
+     * Padding accounts for the missing outer axis, then the already measured
+     * left-axis difference removes the smaller label-width mismatch as well.
+     */
+    alignThermalPlotArea() {
+        const energy = this.chartInstance;
+        const thermal = this.thermalChartInstance;
+        if (!energy?.chartArea || !thermal?.chartArea || !energy.scales?.y2) return;
+        // Chart.js lays out scales before chartArea exists. After that first layout,
+        // the energy chart's left scale already has its final measured width.
+        thermal.scales.temperature.options.afterFit = scale => {
+            scale.width = energy.scales.y.width;
+        };
+        thermal.options.layout.padding.right =
+            4 + Math.max(0, energy.scales.y2.width);
+        thermal.update('none');
+        // Match the residual plot-edge difference, not only the axis widths.
+        thermal.options.layout.padding.left = Math.max(
+            0,
+            thermal.options.layout.padding.left + energy.chartArea.left
+                - thermal.chartArea.left,
+        );
+        thermal.options.layout.padding.right = Math.max(
+            0,
+            thermal.options.layout.padding.right + thermal.chartArea.right
+                - energy.chartArea.right,
+        );
+        thermal.update('none');
+    }
+
+    /**
+     * Draw the final external thermal simulation below the energy chart.
+     *
+     * Temperature and operating modes share the response's grid and anchor. Gaps
+     * remain gaps; an absent/expired sidecar hides the whole optional panel.
+     */
+    updateThermalChart(data_response, data_controls) {
+        const panel = document.getElementById('thermal_chart_panel');
+        const canvas = document.getElementById('thermalChart');
+        if (!panel || !canvas) return;
+        const forecasts = Object.values(data_response?.thermal_forecast || {})
+            .filter(item => item && item.series);
+        if (!forecasts.length) {
+            panel.style.display = 'none';
+            return;
+        }
+        const base = data_controls['used_time_frame_base'];
+        const slot = ChartManager.payloadSlot(data_response, base, new Date(data_response.timestamp));
+        const length = data_response?.result?.Last_Wh_pro_Stunde?.length || 0;
+        const labels = Array.from({length}, (_, index) => {
+            const label = ChartManager.slotStartTime(data_response, slot + index, base)
+                .toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+            // The energy chart names its first slot with the actual run time.
+            // Using that same label avoids a false quarter-hour shift at the edge.
+            return index === 0
+                ? new Date(data_response.timestamp).toLocaleTimeString(
+                    [], {hour: '2-digit', minute: '2-digit'}
+                )
+                : label;
+        });
+        const thermal = forecasts[0];
+        const series = thermal.series || {};
+        const tempSeries = (name, color, dash = []) => ({
+            label: name === 'buffer_c' ? 'Buffer (HK1)'
+                : name === 'dhw_c' ? 'DHW' : 'Outdoor',
+            data: ChartManager.alignToAxis(series[name] || [], slot, length, base),
+            borderColor: color,
+            backgroundColor: color,
+            borderWidth: 2,
+            borderDash: dash,
+            pointRadius: 0,
+            pointHoverRadius: 4,
+            spanGaps: false,
+            yAxisID: 'temperature',
+        });
+        const modes = ChartManager.alignToAxis(series.mode || [], slot, length, base);
+        const probability = ChartManager.alignToAxis(
+            thermal.run_probability || [], slot, length, base
+        );
+        // Fractional occupancy keeps partial slots partial. The band therefore
+        // ends with the actual compressor stop instead of covering the cooldown.
+        const heat = probability.map(value =>
+            value === null || value === undefined ? null : Number(value)
+        );
+        const datasets = [
+            tempSeries('buffer_c', '#4a9eff'),
+            tempSeries('dhw_c', '#e05fd2'),
+            tempSeries('outdoor_c', '#9aa7b4', [4, 4]),
+            {
+                label: 'WP operating (SG2/SG3)',
+                data: heat,
+                type: 'line',
+                borderColor: 'rgba(240,140,58,0.65)',
+                backgroundColor: 'rgba(240,140,58,0.06)',
+                fill: true,
+                stepped: true,
+                pointRadius: 0,
+                yAxisID: 'operating',
+            },
+        ];
+        if (!this.thermalChartInstance) {
+            this.thermalChartInstance = new Chart(canvas.getContext('2d'), {
+                type: 'line',
+                data: {labels, datasets},
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    layout: {padding: {bottom: 12, left: 4, right: 4}},
+                    interaction: {mode: 'index', intersect: false},
+                    scales: {
+                        temperature: {
+                            beginAtZero: false,
+                            title: {display: true, text: 'Temperature (°C)', color: 'lightgray'},
+                            ticks: {color: 'lightgray', callback: value => `${value} °C`},
+                            grid: {color: 'rgb(54, 54, 54)'},
+                        },
+                        operating: {
+                            min: 0,
+                            max: 1,
+                            position: 'right',
+                            title: {display: true, text: 'WP operating share', color: 'darkgray'},
+                            ticks: {color: 'darkgray', callback: value => `${Math.round(value * 100)}%`},
+                            grid: {drawOnChartArea: false},
+                        },
+                        x: {ticks: {color: 'lightgray', maxTicksLimit: 16}},
+                    },
+                    plugins: {
+                        legend: {display: !isMobile(), labels: {color: 'lightgray'}},
+                        tooltip: {
+                            callbacks: {
+                                label: context => context.dataset.yAxisID === 'operating'
+                                    ? `WP operating: ${Math.round(context.parsed.y * 100)}% of slot`
+                                    : `${context.dataset.label}: ${Number(context.parsed.y).toFixed(1)} °C`,
+                                afterBody: items => {
+                                    const index = items[0]?.dataIndex;
+                                    const mode = modes[index];
+                                    const share = Number(probability[index]);
+                                    const detail = share > 0
+                                        ? `; ${Math.round(share * 100)}% of slot operating` : '';
+                                    return mode ? `Simulated mode: ${mode}${detail}` : '';
+                                },
+                            },
+                        },
+                    },
+                },
+            });
+        } else {
+            this.thermalChartInstance.data.labels = labels;
+            this.thermalChartInstance.data.datasets = datasets;
+            this.thermalChartInstance.update('none');
+        }
+        const status = document.getElementById('thermal_chart_status');
+        if (status) {
+            const count = forecasts.length;
+            status.textContent = `${count} external profile${count === 1 ? '' : 's'}`;
+        }
+        panel.style.display = 'block';
+        this.alignThermalPlotArea();
     }
 
     /**
@@ -180,21 +395,34 @@ class ChartManager {
         const gesamtlastSliced = ChartManager.alignToAxis(
             data_request["ems"]["gesamtlast"], axisSlot, axisLength, time_frame_base
         );
-        // Calculate consumption (excluding home appliances)
+        // The managed loads that are part of gesamtlast rather than something the
+        // solver placed - a pushed or pulled profile, and any contingent load no
+        // backend could time. They come out of the Load bar below and go into the band,
+        // which leaves the stack total untouched and finally makes the appliance
+        // visible: before this it was inside the Load bar with nothing to say so, which
+        // is what issue #362 reported.
+        const forecastWh = ChartManager.managedLoadTotals(
+            data_response["managed_load_forecast"], axisSlot, axisLength, time_frame_base
+        );
+        // Calculate consumption (excluding home appliances and managed loads)
         this.chartInstance.data.datasets[0].data = gesamtlastSliced.map((value, index) => {
             const actHomeApplianceValue = data_response["result"]["Home_appliance_wh_per_hour"][index] || 0;
-            return ((value - actHomeApplianceValue) / 1000).toFixed(3);
+            const managedValue = forecastWh[index] || 0;
+            return (Math.max(0, value - actHomeApplianceValue - managedValue) / 1000).toFixed(3);
         });
 
         // Home appliances
         this.chartInstance.data.datasets[1].data = data_response["result"]["Home_appliance_wh_per_hour"].map(value => (value / 1000).toFixed(3));
 
-        // Managed loads the optimizer placed. Only the built-in solver reports these;
-        // under the others the loads are still inside gesamtlast and the Load bar above
-        // already counts them, so an absent key has to leave the band empty rather than
-        // draw a zero line.
+        // The band: what the solver placed plus what the forecast carries. Only the
+        // built-in solver reports placements, and only loads it was given; without both
+        // halves a forecast-only appliance has no band at all. Still empty rather than a
+        // zero line when there is nothing, so the legend entry does not imply a load.
         this.chartInstance.data.datasets[13].data = ChartManager.managedLoadSeries(
-            data_response["managed_loads"], axisSlot, axisLength, time_frame_base
+            ChartManager.mergeSchedules(
+                data_response["managed_loads"], data_response["managed_load_forecast"]
+            ),
+            axisSlot, axisLength, time_frame_base
         );
 
         // PV forecast
@@ -399,6 +627,7 @@ class ChartManager {
         }
 
         this.chartInstance.update('none'); // Update without animation
+        this.updateThermalChart(data_response, data_controls);
     }
 
     /**
@@ -539,6 +768,7 @@ class ChartManager {
 
             this.chartInstance.update();
         }
+        this.alignThermalPlotArea();
     }
 }
 

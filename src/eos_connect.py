@@ -399,7 +399,34 @@ load_interface = interface_factory.create_load_interface(
     # here would leave its history subtracted from the base load until a restart,
     # which reads as a household that is lighter than it really is.
     extra_subtract_sensors=load_manager.subtract_sensors,
+    # The Additional Load is handed to the optimizer as a shiftable appliance, so its
+    # measured history leaves the base load - but only EOS places it. EVopt reads no
+    # such device and returns a zero appliance array, so under it the subtraction had
+    # nothing putting the energy back and the appliance simply vanished from the
+    # forecast. A plain value, not a callable: `eos.source` needs a restart anyway.
+    places_additional_load=eos_interface.places_home_appliance,
 )
+
+# Configured and ignored is the worst of the three states, so it gets said out loud
+# once. The energy is no longer lost - it stays in the household forecast - but the
+# shifting the setting promises does not happen, and nothing else on the page would
+# tell anyone that.
+if (
+    config_manager.config.get("load", {}).get("additional_load_1_sensor", "")
+    and not eos_interface.places_home_appliance
+):
+    startup_validator.add_error(
+        "configuration",
+        "additional_load",
+        "warning",
+        "Additional Load is not placed by this optimizer",
+        "An Additional Load sensor is configured, but only the EOS Server backend "
+        "schedules that appliance. Its consumption stays in the household load "
+        "forecast at the times it ran historically, and no start time is published. "
+        "Configure it as a Managed Load to have the optimizer choose when it runs.",
+        action_required=False,
+        config_link="#load",
+    )
 
 # Build the load profile now rather than inside the first optimizer run. It is derived
 # from four finished historical days, so it changes only at midnight and the interface
@@ -792,6 +819,43 @@ def publish_managed_load_release(load_id, release):
     mqtt_interface.update_publish_topics(managed_load_topics.build_values(load_manager))
 
 
+def _refresh_external_thermal_plan(schedules, anchor):
+    """Request one thermal update when EOS publishes a different plan.
+
+    The callback belongs after schedule adoption, where the response is the final
+    optimizer answer rather than the push-time fallback.
+    """
+    import urllib.request
+
+    changed = load_manager.update_thermal_plans(schedules, anchor, commit=False)
+    # Commit only after the refresh request has been decided. Committing in the
+    # preceding staleness check would make the same change look already handled.
+    load_manager._thermal_plan_versions = load_manager._plan_signatures(
+        schedules, anchor
+    )
+    if not changed:
+        return
+    import os
+
+    url = os.environ.get("EOS_HP_TWIN_LOCAL_URL", "").strip()
+    if not url or not url.startswith(("http://127.0.0.1:", "http://localhost:")):
+        return
+    try:
+        req = urllib.request.Request(
+            url.rstrip("/") + "/api/push_now",
+            data=b'{"push": true}',
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=3) as response:
+            logger.info(
+                "[Main] hp-twin thermal-plan refresh requested: HTTP %s",
+                response.status,
+            )
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("[Main] hp-twin thermal-plan refresh failed: %s", exc)
+
+
 load_manager.sources = ManagedLoadSources(
     read_sensor=_managed_load_read_sensor,
     read_sensor_details=_managed_load_read_sensor_details,
@@ -1068,6 +1132,14 @@ def _deferred_inverter_initialization():
         logger.info("[Main] Inverter is ready for control")
 
 
+# What the managed loads contributed to the last request, per load, in the same
+# midnight-anchored slot space as `gesamtlast` and discounted for the partial slot the
+# same way. The chart draws it as its own band and takes it back out of the Load bar;
+# without it a forecast load is in the Load bar with nothing to say so, which is what
+# issue #362 reported. Set on every run of `create_optimize_request`.
+last_managed_forecast = {}
+
+
 # summarize all date
 def create_optimize_request():
     """
@@ -1120,7 +1192,9 @@ def create_optimize_request():
         # Managed loads join the household profile here, and nowhere else. Applied
         # before the partial-slot scaling below so the in-progress slot is discounted
         # once, consistently, for base load and contributions alike.
-        gesamtlast = load_manager.apply(gesamtlast, time_frame_base)
+        gesamtlast, managed_forecast = load_manager.apply(
+            gesamtlast, time_frame_base, per_load=True
+        )
 
         eos_source_for_scale = config_manager.config.get("eos", {}).get(
             "source", "eos_server"
@@ -1156,6 +1230,15 @@ def create_optimize_request():
                         current_slot + 1,
                         ts[current_slot],
                     )
+            # The contributions ride along: they are part of the figure that was just
+            # discounted, and a band the chart subtracts from the Load bar has to have
+            # had the same arithmetic done to it or the current slot goes negative.
+            for series in managed_forecast.values():
+                if series and len(series) > current_slot:
+                    series[current_slot] *= scale_factor
+
+        global last_managed_forecast  # pylint: disable=global-statement
+        last_managed_forecast = managed_forecast
 
         return {
             "pv_prognose_wh": pv_prognose_wh,
@@ -1476,6 +1559,7 @@ class OptimizationScheduler:
             "next_run": None,
         }
         self._update_thread_optimization_loop = None
+        self._response_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._immediate_run_event = threading.Event()
         self._last_avg_runtime = 120  # Initialize with a default value
@@ -1493,10 +1577,9 @@ class OptimizationScheduler:
         return self.last_managed_loads
 
     def get_last_request_response(self):
-        """
-        Returns the last request response.
-        """
-        return self.last_request_response
+        """Return the latest published response without mutating the plan cache."""
+        with self._response_lock:
+            return self.last_request_response
 
     def get_current_state(self):
         """
@@ -1647,6 +1730,19 @@ class OptimizationScheduler:
               necessary configuration values for "eos.timeout" and "refresh_time".
         """
         logger.info("[Main] start new run")
+        # Contingent loads reach a solver that can place them as something to schedule,
+        # beside the request rather than inside it: that dict is posted verbatim to an
+        # EOS server, which validates what it is sent, and no other backend could use
+        # them anyway.
+        #
+        # Asked *before* the request is built, and that order is load-bearing: a load
+        # the fallback planner had taken over gives its placement back as it is
+        # offered, and the household profile below must be assembled after that, or it
+        # carries the energy the solver is about to place a second time.
+        managed_records = None
+        if getattr(eos_interface, "schedules_managed_loads", False):
+            managed_records = load_manager.schedulable()
+
         # create optimize request
         json_optimize_input = create_optimize_request()
         self.__set_state_request()
@@ -1659,13 +1755,7 @@ class OptimizationScheduler:
         mqtt_interface.update_publish_topics(
             {"optimization/state": {"value": self.get_current_state()["request_state"]}}
         )
-        # Contingent loads reach a solver that can place them as something to schedule,
-        # beside the request rather than inside it: that dict is posted verbatim to an
-        # EOS server, which validates what it is sent, and no other backend could use
-        # them anyway.
-        managed_records = None
-        if getattr(eos_interface, "schedules_managed_loads", False):
-            managed_records = load_manager.schedulable()
+        if managed_records is not None:
             optimized_response, avg_runtime = eos_interface.optimize(
                 json_optimize_input,
                 managed_loads=managed_records,
@@ -1709,9 +1799,14 @@ class OptimizationScheduler:
             int((response_now - response_anchor).total_seconds()) // time_frame_base
         )
         optimized_response["anchor"] = response_anchor.isoformat()
-        self.last_request_response["response"] = json.dumps(
-            optimized_response, indent=4
-        )
+        # The managed loads that are part of `gesamtlast` rather than something the
+        # solver placed. Attached here, after the request went out, because it is ours
+        # alone: an EOS server validates what it is posted and would reject the key.
+        optimized_response["managed_load_forecast"] = last_managed_forecast
+        # Optional final thermal state supplied with an external load profile.
+        # It is diagnostic data only: never sent to an external optimizer and
+        # never used for a control decision. Publication happens after adoption
+        # and the plan-version check below.
         self.last_managed_loads = json.dumps(
             {
                 "timestamp": json_optimize_input["timestamp"],
@@ -1723,10 +1818,6 @@ class OptimizationScheduler:
         )
         self.__set_state_response()
 
-        with open(
-            base_path + "/json/optimize_response.json", "w", encoding="utf-8"
-        ) as file:
-            json.dump(optimized_response, file, indent=4)
         # +++++++++
         (
             ac_charge_demand,
@@ -1737,12 +1828,30 @@ class OptimizationScheduler:
         ) = eos_interface.examine_response_to_control_data(optimized_response)
         # Settle each load's gate on what the optimizer decided, before anything else
         # acts on the response. A load the optimizer did not answer for keeps the plan
-        # the managed-load module worked out on its own.
-        if optimized_response.get("managed_loads"):
+        # the managed-load module worked out on its own - which is why this runs
+        # whenever loads were offered at all, not only when something came back: "the
+        # run is over" is news even for a run that placed nothing, and a load that was
+        # handed out and left unanswered has no placement anywhere until it is told.
+        if managed_records is not None:
             load_manager.adopt_schedules(
-                optimized_response["managed_loads"],
+                optimized_response.get("managed_loads") or {},
                 cost=optimized_response.get("managed_loads_cost"),
             )
+        load_manager.update_thermal_plans(
+            optimized_response.get("managed_loads") or {}, response_anchor
+        )
+        optimized_response["thermal_forecast"] = load_manager.thermal_forecasts()
+        with self._response_lock:
+            self.last_request_response["response"] = json.dumps(
+                optimized_response, indent=4
+            )
+        with open(
+            base_path + "/json/optimize_response.json", "w", encoding="utf-8"
+        ) as file:
+            json.dump(optimized_response, file, indent=4)
+        _refresh_external_thermal_plan(
+            optimized_response.get("managed_loads") or {}, response_anchor
+        )
 
         if error is not True:
             setting_control_data(ac_charge_demand, dc_charge_demand, discharge_allowed)
@@ -2010,6 +2119,9 @@ with BOOT.step("scheduler"):
     # shorter than the optimizer's cadence had the fallback planner publishing into
     # the household forecast on top of a solver that was merely about to run.
     load_manager.scheduler_interval = optimization_scheduler.update_interval
+    load_manager.on_contingent_push = (
+        lambda _load_id: optimization_scheduler.request_immediate_run()
+    )
 
 
 def change_control_state():
@@ -2299,12 +2411,24 @@ def get_optimize_request():
 @app.route("/json/optimize_response.json", methods=["GET"])
 def get_optimize_response():
     """
-    Retrieves the last optimization response and returns it as a JSON response.
+    Retrieves the last optimization response, adding a matching asynchronous
+    thermal push for the next dashboard refresh without moving the energy plan.
     """
-    return Response(
-        optimization_scheduler.get_last_request_response()["response"],
-        content_type="application/json",
-    )
+    with optimization_scheduler._response_lock:
+        response_text = optimization_scheduler.last_request_response["response"]
+        try:
+            response = json.loads(response_text)
+            anchor = datetime.fromisoformat(response["anchor"])
+            load_manager.update_thermal_plans(
+                response.get("managed_loads") or {}, anchor
+            )
+            response["thermal_forecast"] = load_manager.thermal_forecasts()
+            response_text = json.dumps(response, indent=4)
+            optimization_scheduler.last_request_response["response"] = response_text
+        except (KeyError, TypeError, ValueError):
+            # Startup and legacy backends without a midnight anchor stay unchanged.
+            pass
+    return Response(response_text, content_type="application/json")
 
 
 @app.route("/json/managed_loads_request.json", methods=["GET"])

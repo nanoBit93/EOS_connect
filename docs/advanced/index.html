@@ -90,7 +90,24 @@
                                 <tr>
                                     <td><code>GET /json/optimize_response.json</code></td>
                                     <td>The optimizer's answer to it &mdash; the schedule everything else is
-                                        derived from.</td>
+                                        derived from. When an external load profile supplies a
+                                        <code>thermal</code> sidecar, the response also contains
+                                        <code>thermal_forecast</code>: final simulated buffer/DHW/outdoor
+                                        temperatures and operating modes on the same EOS time grid. It is
+                                        diagnostic only and is never sent to the optimizer. A plan-bearing
+                                        sidecar is exposed only when its <code>plan.signature</code> and
+                                        <code>contingent_id</code> match the currently published managed-load
+                                        block. A changed or removed plan hides the previous temperature curve;
+                                        a newly pushed matching sidecar is included on the next response read,
+                                        without changing the optimizer's electrical schedule. A contingent
+                                        push is planned provisionally by the fallback and requests an
+                                        immediate optimizer run; hp-twin adopts only the final optimizer
+                                        answer. The optional local development callback
+                                        <code>EOS_HP_TWIN_LOCAL_URL</code> may name only a loopback hp-twin
+                                        URL. It requests a thermal update for an actual plan change, never
+                                        for an unchanged plan, and does not control any hardware. Only a new
+                                        positive contingent offer requests an immediate optimization;
+                                        withdrawing an adopted contingent does not start another cycle.</td>
                                 </tr>
                                 <tr>
                                     <td><code>GET /json/test/&lt;filename&gt;</code></td>
