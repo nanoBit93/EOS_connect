@@ -35,3 +35,4 @@ options:
 schema:
   time_zone: str
   log_level: list(debug|info|warning|error)
+# Build trigger: re-run add-on image build after Actions outage 2026-11-11
